@@ -323,7 +323,7 @@ func (e *Engine) run(ctx context.Context, m *managed) {
 		return
 	}
 
-	w, err := openPartFile(t.SavePath, t.TotalSize)
+	w, err := openPartFile(t.SavePath)
 	if err != nil {
 		e.fail(t, ctx, err)
 		return

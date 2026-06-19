@@ -13,9 +13,12 @@ type fileWriter struct {
 	partPath string
 }
 
-// openPartFile creates (or opens for resume) the .part file for a task and
-// preallocates it to totalSize when the size is known.
-func openPartFile(savePath string, totalSize int64) (*fileWriter, error) {
+// openPartFile creates (or opens for resume) the .part file for a task.
+// It deliberately does not preallocate totalSize: on large downloads Windows
+// filesystems, filter drivers, or antivirus can make first-run Truncate very
+// slow, while pause/resume appears fast because the sparse/allocated file is
+// already present. WriteAt will grow the file as each segment arrives.
+func openPartFile(savePath string) (*fileWriter, error) {
 	if err := os.MkdirAll(filepath.Dir(savePath), 0o755); err != nil {
 		return nil, err
 	}
@@ -23,12 +26,6 @@ func openPartFile(savePath string, totalSize int64) (*fileWriter, error) {
 	f, err := os.OpenFile(pp, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, err
-	}
-	if totalSize > 0 {
-		if err := f.Truncate(totalSize); err != nil {
-			f.Close()
-			return nil, err
-		}
 	}
 	return &fileWriter{f: f, partPath: pp}, nil
 }

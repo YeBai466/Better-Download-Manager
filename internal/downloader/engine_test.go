@@ -413,3 +413,20 @@ func TestTaskProxyPersistsAcrossRecord(t *testing.T) {
 		t.Fatalf("proxy mismatch: got %+v want %+v", task.Proxy, want)
 	}
 }
+
+func TestOpenPartFileDoesNotPreallocate(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "large.bin")
+	w, err := openPartFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	info, err := os.Stat(partPath(dst))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("expected new part file size 0, got %d", info.Size())
+	}
+}
