@@ -132,6 +132,19 @@ extensions/
 
 B Download Manager is built with **Go + React (Wails v3)** and reuses the system WebView2 instead of bundling Chromium, so every release stays a **single, lightweight executable**. It keeps the familiar IDM workflow while adding crash-safe resumable downloads and out-of-the-box browser takeover. The UI ships in **both English and Simplified Chinese** — switch anytime under **Options → Language / 语言**, applied instantly.
 
+<div align="center">
+
+<img src="screenshot/HomePage.png" alt="Main window" width="820" />
+
+<sub>IDM-style main window: toolbar, category sidebar and task list</sub>
+
+</div>
+
+| Add Download | Multithreaded progress |
+|:---:|:---:|
+| <img src="screenshot/download.png" alt="Add download dialog" width="380" /> | <img src="screenshot/downloading.png" alt="Multithreaded download progress" width="380" /> |
+| <sub>Resume support, categories and connection count</sub> | <sub>Live per-thread progress at a glance</sub> |
+
 | | Feature | Details |
 |---|---|---|
 | 🚀 | **Multithreaded segmented downloads** | HTTP Range, 8 parallel connections by default |
