@@ -1,46 +1,101 @@
+<div align="center">
+
 # B Download Manager
 
-一个仅面向 **Windows** 的仿 IDM 多线程下载器，使用 **Go + React (Wails v3)** 构建。
-单文件、小体积（使用系统 WebView2，不打包 Chromium），支持：
+**一款面向 Windows 的现代多线程下载器**
 
-- 🚀 **多线程分段下载**（HTTP Range，默认 8 连接）
-- ⏸ **断点续传**（崩溃安全的 `.bdmeta` sidecar + SQLite 持久化）
-- 🌐 **浏览器接管**（Chrome / Edge / Firefox 扩展，拦截下载并转交本程序）
-- 🛡 **代理支持**（系统代理 / 自定义 HTTP(S) / SOCKS5）
-- 🗂 **IDM 风格 UI**（工具栏、分类侧栏、任务表、独立添加/进度窗口、系统托盘）
-- 🔁 **开机自启**（可选最小化到托盘）
-- ⬆ **自动检查更新**（GitHub Releases，显示更新内容并跳转下载）
+仿 IDM 体验 · 单文件 · 小体积 · 浏览器无缝接管
+
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)](https://github.com/YeBai466/B_Download_Manager/releases)
+[![Built with](https://img.shields.io/badge/built%20with-Go%20%2B%20Wails%20v3-00ADD8?logo=go&logoColor=white)](https://wails.io)
+[![Frontend](https://img.shields.io/badge/UI-React%20%2B%20TypeScript-61DAFB?logo=react&logoColor=white)](https://react.dev)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Releases](https://img.shields.io/github/v/release/YeBai466/B_Download_Manager?label=download&color=success)](https://github.com/YeBai466/B_Download_Manager/releases)
+
+[安装](#安装与更新) · [功能](#核心功能) · [预览](#预览) · [浏览器扩展](#浏览器扩展) · [开发](#开发与构建) · [架构](#项目架构)
+
+</div>
+
+---
+
+## 概览
+
+B Download Manager 使用 **Go + React（Wails v3）** 构建，复用系统内置的 WebView2 而非打包 Chromium，因此发行版始终是**单文件、低占用**。它在保留 IDM 经典工作流的同时，提供崩溃安全的断点续传与开箱即用的浏览器接管能力。
+
+## 预览
+
+<div align="center">
+
+<img src="screenshot/首页截图.jpg" alt="主界面" width="820" />
+
+<sub>IDM 风格主界面：工具栏、分类侧栏与任务列表</sub>
+
+</div>
+
+| 添加下载 | 多线程下载进度 |
+|:---:|:---:|
+| <img src="screenshot/下载框.png" alt="添加下载对话框" width="380" /> | <img src="screenshot/下载中.png" alt="多线程下载进度" width="380" /> |
+| <sub>支持断点续传、分类与连接数设置</sub> | <sub>每条线程的实时进度一目了然</sub> |
+
+## 核心功能
+
+| | 功能 | 说明 |
+|---|---|---|
+| 🚀 | **多线程分段下载** | 基于 HTTP Range，默认 8 连接并行 |
+| ⏸ | **断点续传** | 崩溃安全的 `.bdmeta` sidecar + SQLite 持久化 |
+| 🌐 | **浏览器接管** | Chrome / Edge / Firefox 扩展拦截下载并转交本程序 |
+| 🛡 | **代理支持** | 系统代理 / 自定义 HTTP(S) / SOCKS5 |
+| 🗂 | **IDM 风格界面** | 工具栏、分类侧栏、任务表、独立添加/进度窗口、系统托盘 |
+| 🔁 | **开机自启** | 可选最小化到托盘 |
+| ⬆ | **自动更新** | 检查 GitHub Releases，展示更新内容并一键跳转 |
 
 ## 安装与更新
 
-从 [Releases](https://github.com/YeBai466/B_Download_Manager/releases) 下载最新的 `*-installer.exe` 安装。
-更新时直接下载新版安装包**覆盖安装即可**——下载记录与所有设置保存在 `%AppData%\BDownloadManager`，
-不随程序更新或卸载而清除（彻底清空请手动删除该目录）。安装目录内附带 `uninstall.exe`，
-也可从「控制面板 → 程序和功能」卸载。
+从 [Releases](https://github.com/YeBai466/B_Download_Manager/releases) 下载最新的 `*-installer.exe` 并安装。
 
+更新时直接下载新版安装包**覆盖安装即可**。下载记录与全部设置保存在 `%AppData%\BDownloadManager`，不随程序更新或卸载而清除（如需彻底清空请手动删除该目录）。安装目录内附带 `uninstall.exe`，也可从「控制面板 → 程序和功能」卸载。
+
+## 浏览器扩展
+
+应用运行时会在 `127.0.0.1:9614` 启动接管服务（端口与开关可在「选项 → 浏览器接管」中调整）。扩展会取消浏览器自带下载并转交本程序——按设置弹出添加对话框或直接开始；**若程序未运行，扩展自动回退为浏览器原生下载。**
+
+#### Chrome / Edge
+
+扩展已发布于 Chrome 网上应用店，提供两种安装方式：
+
+- **一键静默安装** — 在「选项 → 浏览器接管」勾选浏览器并点击「一键安装」（需一次 UAC 管理员授权），重启浏览器后生效。可随时在同一页面卸载。
+- **手动安装** — 在网上应用店搜索 “B Download Manager”，点击「添加至 Chrome」。
+
+> 启动时若检测到未安装会弹窗提醒（可选「下次再说 / 从此忽略」），**不会在未经同意的情况下自动安装。**
+
+#### Firefox
+
+打开 `about:debugging#/runtime/this-firefox` →「临时加载附加组件」→ 选择 `extensions/firefox/manifest.json`。
 
 ## 环境要求
 
-- Go 1.25+（Wails v3 要求）
-- Node.js 20+
-- Windows 10/11 + WebView2 运行时（系统通常已内置）
-- Wails v3 CLI：`go install github.com/wailsapp/wails/v3/cmd/wails3@latest`
+| 依赖 | 版本 |
+|---|---|
+| Go | 1.25+（Wails v3 要求） |
+| Node.js | 20+ |
+| 系统 | Windows 10/11 + WebView2 运行时（通常已内置） |
+| Wails CLI | `go install github.com/wailsapp/wails/v3/cmd/wails3@latest` |
 
 ## 开发与构建
 
 ```bash
 wails3 dev      # 开发模式（前后端热重载）
-wails3 build    # 生产构建 -> bin/b-download-manager.exe
+wails3 build    # 生产构建 → bin/b-download-manager.exe
 wails3 package  # 生成 NSIS 安装包（需先安装 NSIS：winget install NSIS.NSIS）
 ```
 
-仅运行 Go 单元测试：
+运行 Go 单元测试：
 
 ```bash
 go test ./internal/...
 ```
 
-## 项目结构
+## 项目架构
 
 ```
 main.go                 应用入口：窗口、系统托盘、服务装配
@@ -58,26 +113,17 @@ extensions/
   firefox/              Firefox 扩展（WebExtension）
 ```
 
-## 安装浏览器扩展
-
-应用运行时会在 `127.0.0.1:9614` 启动接管服务（可在「选项 → 浏览器接管」修改端口/开关）。
-
-**Chrome / Edge（从应用商店安装）**：扩展已发布在 Chrome 网上应用店。两种方式：
-
-1. **一键静默安装**：在「选项 → 浏览器接管」勾选浏览器 → 点「一键安装」（需一次管理员授权 UAC），
-   重启浏览器后生效。由于扩展来自应用商店，个人电脑也能通过企业策略
-   （`ExtensionInstallForcelist` 指向 Google 官方更新地址）强制安装。可随时在同一页面卸载。
-2. **手动从商店安装**：在网上应用店搜索 “B Download Manager” 点「添加至 Chrome」即可。
-
-> 启动时若检测到未安装会弹窗提醒（可选「下次再说 / 从此忽略」），**不会在未经同意的情况下自动安装。**
-
-**Firefox（手动加载）**：`about:debugging#/runtime/this-firefox` →「临时加载附加组件」→ 选择 `extensions/firefox/manifest.json`。
-
-扩展会取消浏览器自身下载并转交本程序（按设置弹出添加对话框或直接开始）；若程序未运行，扩展自动回退为浏览器原生下载。
-
 ## 测试覆盖
 
-- `internal/downloader`：分段下载、无 Range 单流回退、断点续传、暂停/恢复（含 `-race`）
-- `internal/service`：添加→下载→落盘→持久化全链路
-- `internal/takeover`：接管 HTTP 接口（/ping、/download）与端口热切换
-- `internal/updates`：版本号比较与解析
+- **`internal/downloader`** — 分段下载、无 Range 单流回退、断点续传、暂停/恢复（含 `-race`）
+- **`internal/service`** — 添加 → 下载 → 落盘 → 持久化 全链路
+- **`internal/takeover`** — 接管 HTTP 接口（`/ping`、`/download`）与端口热切换
+- **`internal/updates`** — 版本号比较与解析
+
+## 许可证
+
+本项目以 [MIT License](LICENSE) 开源发布。
+
+<div align="center">
+<sub>Built with Go · Wails v3 · React — for Windows.</sub>
+</div>
