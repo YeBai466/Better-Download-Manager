@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MsixPackagingToolTemplate
+    xmlns="http://schemas.microsoft.com/msix/packaging/msixpackagingtool/template/2022">
+    <Settings
+        AllowTelemetry="false"
+        ApplyACLsToPackageFiles="true"
+        GenerateCommandLineFile="true"
+        AllowPromptForPassword="false">
+    </Settings>
+    <Installer
+        Path="b_download_manager.exe"
+        Arguments=""
+        InstallLocation="C:\Program Files\yebai\B Download Manager">
+    </Installer>
+    <PackageInformation
+        PackageName="B Download Manager"
+        PackageDisplayName="B Download Manager"
+        PublisherName="CN=yebai"
+        PublisherDisplayName="yebai"
+        Version="0.1.0.0"
+        PackageDescription="仿 IDM 多线程下载器">
+        <Capabilities>
+            <Capability Name="runFullTrust" />
+            
+        </Capabilities>
+        <Applications>
+            <Application
+                Id="com.yebai.bdownloadmanager"
+                Description="仿 IDM 多线程下载器"
+                DisplayName="B Download Manager"
+                ExecutableName="b_download_manager.exe"
+                EntryPoint="Windows.FullTrustApplication">
+                
+            </Application>
+        </Applications>
+        <Resources>
+            <Resource Language="en-us" />
+        </Resources>
+        <Dependencies>
+            <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.19041.0" />
+        </Dependencies>
+        <Properties>
+            <Framework>false</Framework>
+            <DisplayName>B Download Manager</DisplayName>
+            <PublisherDisplayName>yebai</PublisherDisplayName>
+            <Description>仿 IDM 多线程下载器</Description>
+            <Logo>Assets\AppIcon.png</Logo>
+        </Properties>
+    </PackageInformation>
+    <SaveLocation PackagePath="b_download_manager.msix" />
+    <PackageIntegrity>
+        <CertificatePath></CertificatePath>
+    </PackageIntegrity>
+</MsixPackagingToolTemplate>

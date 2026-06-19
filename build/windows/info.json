@@ -1,0 +1,15 @@
+{
+	"fixed": {
+		"file_version": "1.0.0"
+	},
+	"info": {
+		"0000": {
+			"ProductVersion": "1.0.0",
+			"CompanyName": "yebai",
+			"FileDescription": "仿 IDM 多线程下载器",
+			"LegalCopyright": "© 2026 yebai",
+			"ProductName": "B Download Manager",
+			"Comments": "Go + React (Wails v3) multi-threaded download manager"
+		}
+	}
+}

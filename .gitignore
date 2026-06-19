@@ -1,0 +1,33 @@
+# Build output
+.task
+bin/
+*.exe
+*.syso
+*.db
+
+# Frontend (installed deps, build output, generated bindings)
+frontend/dist
+frontend/node_modules
+frontend/bindings
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+
+# Store materials — kept local only, never pushed
+/store/
+
+# Wails build artifacts
+build/linux/appimage/build
+build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+# Mobile generated (per-machine; overlays hold absolute paths)
+build/ios/xcode/overlay.json
+build/ios/xcode/gen/
+build/android/overlay.json
+build/android/gen/
+# Mobile build caches / outputs (generated, not source)
+build/android/.gradle/
+build/android/build/
+build/android/local.properties
+build/ios/Pods/
+build/ios/DerivedData/

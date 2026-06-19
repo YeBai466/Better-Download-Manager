@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "B Download Manager Integration",
+  "version": "1.0.0",
+  "description": "拦截浏览器下载并交给 B Download Manager 多线程下载。",
+  "permissions": ["downloads", "cookies", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "B Download Manager"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "manifest_version": 2,
+  "name": "B Download Manager Integration",
+  "version": "1.0.0",
+  "description": "拦截浏览器下载并交给 B Download Manager 多线程下载。",
+  "permissions": [
+    "downloads",
+    "cookies",
+    "storage",
+    "<all_urls>",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_title": "B Download Manager"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bdm@yebai.github.io"
+    }
+  }
+}

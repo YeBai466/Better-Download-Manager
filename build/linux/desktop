@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=B Download Manager
+Comment=仿 IDM 多线程下载器
+# The Exec line includes %u to pass the URL to the application
+Exec=/usr/local/bin/b_download_manager.exe %u
+Terminal=false
+Type=Application
+Icon=b_download_manager.exe
+Categories=Utility;
+StartupWMClass=b_download_manager.exe
+
+ 

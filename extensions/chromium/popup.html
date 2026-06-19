@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; width: 240px; margin: 0; padding: 14px; font-size: 13px; color: #1f2733; }
+      h1 { font-size: 14px; margin: 0 0 12px; }
+      .row { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; }
+      .status { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #c3c9d2; }
+      .dot.on { background: #2db84d; }
+      .dot.off { background: #d93025; }
+      input[type="number"] { width: 72px; padding: 4px 6px; border: 1px solid #c3c9d2; border-radius: 5px; }
+      .switch { cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h1>B Download Manager</h1>
+    <div class="row">
+      <label class="switch"><input type="checkbox" id="enabled" /> 接管浏览器下载</label>
+    </div>
+    <div class="row">
+      <span>端口</span>
+      <input type="number" id="port" min="1" max="65535" />
+    </div>
+    <div class="row">
+      <span class="status"><span class="dot" id="dot"></span><span id="statusText">检测中…</span></span>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>
