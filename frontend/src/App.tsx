@@ -15,6 +15,7 @@ import TaskTable from "./components/TaskTable";
 import OptionsDialog from "./components/OptionsDialog";
 import ProgressDialog from "./components/ProgressDialog";
 import ExtPromptDialog from "./components/ExtPromptDialog";
+import UpdateDialog, { type UpdateInfo } from "./components/UpdateDialog";
 import { formatSpeed } from "./format";
 
 export default function App() {
@@ -27,6 +28,7 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [extPrompt, setExtPrompt] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
 
   const upsert = useCallback((t: TaskInfo) => {
     setTasks((prev) => new Map(prev).set(t.id, t));
@@ -46,7 +48,17 @@ export default function App() {
       setSettings(cfg);
       // On startup, offer the one-time manual extension install (unless ignored).
       if (cfg.takeoverEnabled && !cfg.extPromptIgnored) setExtPrompt(true);
+      // Auto-check for updates (silent unless a newer version exists).
+      if (cfg.autoCheckUpdate) {
+        api.checkForUpdates()
+          .then((r) => { if (r.hasUpdate) setUpdate(r as UpdateInfo); })
+          .catch(() => {});
+      }
     });
+
+    // Manual "立即检查更新" in Options dispatches this when an update is found.
+    const onUpd = (e: Event) => setUpdate((e as CustomEvent).detail as UpdateInfo);
+    window.addEventListener("bdm:update", onUpd);
 
     const offUpdate = onEvent<TaskInfo>(EVT_TASK_UPDATE, upsert);
     const offRemoved = onEvent<string>(EVT_TASK_REMOVED, (id) =>
@@ -59,6 +71,7 @@ export default function App() {
     return () => {
       offUpdate();
       offRemoved();
+      window.removeEventListener("bdm:update", onUpd);
     };
   }, [reload, upsert]);
 
@@ -114,6 +127,16 @@ export default function App() {
     setExtPrompt(false);
   };
 
+  const checkUpdateNow = async () => {
+    try {
+      const r = await api.checkForUpdates();
+      if (r.hasUpdate) setUpdate(r as UpdateInfo);
+      else alert(`已是最新版本（v${r.current}）`);
+    } catch (e: any) {
+      alert("检查更新失败：" + String(e?.message ?? e));
+    }
+  };
+
   return (
     <div className="app">
       <MenuBar
@@ -138,7 +161,10 @@ export default function App() {
           },
           {
             title: "帮助",
-            items: [{ label: "关于 B Download Manager", onClick: () => setShowAbout(true) }],
+            items: [
+              { label: "检查更新…", onClick: checkUpdateNow },
+              { label: "关于 B Download Manager", onClick: () => setShowAbout(true) },
+            ],
           },
         ]}
       />
@@ -198,6 +224,8 @@ export default function App() {
       {extPrompt && (
         <ExtPromptDialog onLater={() => setExtPrompt(false)} onIgnore={ignoreExt} />
       )}
+
+      {update && <UpdateDialog info={update} onClose={() => setUpdate(null)} />}
 
       {showAbout && (
         <div className="overlay" onMouseDown={() => setShowAbout(false)}>

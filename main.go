@@ -70,6 +70,7 @@ func main() {
 		Height:           680,
 		MinWidth:         860,
 		MinHeight:        520,
+		Hidden:           startMinimized(),
 		BackgroundColour: application.NewRGB(245, 246, 248),
 		URL:              "/",
 	})
@@ -108,6 +109,17 @@ func setupTray(app *application.App, window application.Window) {
 		window.Show()
 		window.Focus()
 	})
+}
+
+// startMinimized reports whether the app was launched with --minimized (used by
+// the login autostart entry so it starts hidden in the tray).
+func startMinimized() bool {
+	for _, a := range os.Args[1:] {
+		if a == "--minimized" || a == "-minimized" {
+			return true
+		}
+	}
+	return false
 }
 
 // databasePath returns the path to the SQLite database in the user's config dir.

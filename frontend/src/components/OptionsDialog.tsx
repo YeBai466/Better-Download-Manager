@@ -21,6 +21,9 @@ export default function OptionsDialog({ onClose, onSaved }: Props) {
   const [tab, setTab] = useState<Tab>("general");
   const [s, setS] = useState<Settings | null>(null);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const [appVersion, setAppVersion] = useState("");
+  const [updateMsg, setUpdateMsg] = useState("");
 
   useEffect(() => {
     api.getSettings().then(setS);
@@ -44,6 +47,26 @@ export default function OptionsDialog({ onClose, onSaved }: Props) {
   const pickFolder = async () => {
     const dir = await api.chooseFolder();
     if (dir) patch({ downloadDir: dir });
+  };
+
+  const checkUpdate = async () => {
+    setBusy("update");
+    setUpdateMsg("");
+    try {
+      const r = await api.checkForUpdates();
+      setAppVersion(r.current);
+      if (r.hasUpdate) {
+        setUpdateMsg(`　·　发现新版本 ${r.latest}`);
+        // Open the update window for the changelog + download.
+        window.dispatchEvent(new CustomEvent("bdm:update", { detail: r }));
+      } else {
+        setUpdateMsg("　·　已是最新版本");
+      }
+    } catch (e: any) {
+      setUpdateMsg("　·　检查失败：" + String(e?.message ?? e));
+    } finally {
+      setBusy("");
+    }
   };
 
   return (
@@ -75,6 +98,37 @@ export default function OptionsDialog({ onClose, onSaved }: Props) {
                     <input type="checkbox" checked={s.categorize} onChange={(e) => patch({ categorize: e.target.checked })} />
                     按文件类型自动归类到子目录（视频 / 音乐 / 文档…）
                   </label>
+                </div>
+
+                <h3 style={{ marginTop: 18 }}>启动</h3>
+                <div className="field">
+                  <label className="checkbox">
+                    <input type="checkbox" checked={s.autoStart} onChange={(e) => patch({ autoStart: e.target.checked })} />
+                    开机时自动启动
+                  </label>
+                </div>
+                <div className="field">
+                  <label className="checkbox" style={{ opacity: s.autoStart ? 1 : 0.45 }}>
+                    <input type="checkbox" disabled={!s.autoStart} checked={s.startMinimized}
+                      onChange={(e) => patch({ startMinimized: e.target.checked })} />
+                    开机启动时最小化到系统托盘
+                  </label>
+                </div>
+
+                <h3 style={{ marginTop: 18 }}>更新</h3>
+                <div className="field">
+                  <label className="checkbox">
+                    <input type="checkbox" checked={s.autoCheckUpdate} onChange={(e) => patch({ autoCheckUpdate: e.target.checked })} />
+                    启动时自动检查更新（GitHub Releases）
+                  </label>
+                </div>
+                <div className="field">
+                  <div className="row">
+                    <button className="btn" onClick={checkUpdate} disabled={busy === "update"}>
+                      {busy === "update" ? "检查中…" : "立即检查更新"}
+                    </button>
+                    <span className="hint" style={{ flex: 1 }}>当前版本 {appVersion}{updateMsg}</span>
+                  </div>
                 </div>
               </div>
             )}

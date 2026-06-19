@@ -25,6 +25,7 @@ import (
 	"github.com/yebai/b-download-manager/internal/policy"
 	"github.com/yebai/b-download-manager/internal/store"
 	"github.com/yebai/b-download-manager/internal/takeover"
+	"github.com/yebai/b-download-manager/internal/updates"
 )
 
 // Frontend event names.
@@ -338,7 +339,52 @@ func (s *DownloadService) SaveSettings(cfg config.Settings) (config.Settings, er
 	} else {
 		_ = s.takeover.Stop()
 	}
+	s.applyAutostart(cfg.AutoStart)
 	return cfg, nil
+}
+
+// applyAutostart registers or removes the login autostart entry to match cfg.
+func (s *DownloadService) applyAutostart(enabled bool) {
+	app := application.Get()
+	if app == nil || app.Autostart == nil {
+		return
+	}
+	cur, _ := app.Autostart.IsEnabled()
+	if enabled {
+		// Re-register every save so the --minimized argument tracks the current
+		// StartMinimized setting.
+		_ = app.Autostart.Disable()
+		opts := application.AutostartOptions{}
+		s.mu.RLock()
+		if s.settings.StartMinimized {
+			opts.Arguments = []string{"--minimized"}
+		}
+		s.mu.RUnlock()
+		if err := app.Autostart.EnableWithOptions(opts); err != nil {
+			fmt.Println("autostart enable:", err)
+		}
+	} else if cur {
+		if err := app.Autostart.Disable(); err != nil {
+			fmt.Println("autostart disable:", err)
+		}
+	}
+}
+
+// CheckForUpdates queries GitHub Releases and returns version + notes. The bool
+// arg is ignored; it exists so the frontend can call it explicitly.
+func (s *DownloadService) CheckForUpdates() (updates.Result, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return updates.Check(ctx, Version)
+}
+
+// OpenURL opens a URL in the user's default browser (used for the release page
+// / installer download link).
+func (s *DownloadService) OpenURL(url string) error {
+	if app := application.Get(); app != nil {
+		return app.Browser.OpenURL(url)
+	}
+	return openInShell(url)
 }
 
 // Categories returns the available category names for the UI sidebar.

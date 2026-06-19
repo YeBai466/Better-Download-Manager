@@ -30,6 +30,9 @@ type Settings struct {
 	TakeoverPort     int              `json:"takeoverPort"`
 	TakeoverAction   TakeoverAction   `json:"takeoverAction"`
 	ExtPromptIgnored bool             `json:"extPromptIgnored"` // user chose "ignore forever" for the install prompt
+	AutoStart        bool             `json:"autoStart"`        // launch at Windows login
+	StartMinimized   bool             `json:"startMinimized"`   // when autostarted, start hidden in tray
+	AutoCheckUpdate  bool             `json:"autoCheckUpdate"`  // check GitHub releases on startup
 }
 
 // DefaultDownloadDir returns the user's Downloads folder, falling back to the
@@ -59,6 +62,9 @@ func Default() Settings {
 		TakeoverPort:     9614,
 		TakeoverAction:   ActionShowDialog,
 		ExtPromptIgnored: false,
+		AutoStart:        false,
+		StartMinimized:   true,
+		AutoCheckUpdate:  true,
 	}
 }
 

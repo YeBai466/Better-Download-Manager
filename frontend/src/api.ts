@@ -35,6 +35,8 @@ export const api = {
   showAddWindow: (p: { url?: string; filename?: string; headers?: Record<string, string> }) =>
     DownloadService.ShowAddWindow({ url: p.url ?? "", filename: p.filename ?? "", headers: p.headers ?? {} }),
   consumePendingAdd: () => DownloadService.ConsumePendingAdd(),
+  checkForUpdates: () => DownloadService.CheckForUpdates(),
+  openURL: (url: string) => DownloadService.OpenURL(url),
 };
 
 // onEvent subscribes to a backend event and returns an unsubscribe function.

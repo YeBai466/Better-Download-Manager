@@ -275,3 +275,16 @@ input[type="text"]:focus, input[type="number"]:focus, select:focus { outline: no
 .info-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 12px; }
 .info-grid .k { color: var(--muted); }
 .info-grid .v { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.changelog {
+  white-space: pre-wrap;
+  font-size: 12.5px;
+  line-height: 1.7;
+  max-height: 280px;
+  overflow: auto;
+  background: #f7f9fb;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: #2c3744;
+}
