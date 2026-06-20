@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -42,11 +43,11 @@ const (
 // focus it when a browser download arrives.
 const MainWindowName = "main"
 
-// AddWindowName is the name of the separate "add download" window (IDM-style).
-const AddWindowName = "add"
+// Add-download windows are created on demand with unique names ("add-N") so any
+// number of downloads can have their own independent window (IDM-style).
 
 // Version is the application version reported to the browser extension.
-const Version = "1.1.1"
+const Version = "1.1.2"
 
 // StoreExtensionID is the published Chrome Web Store extension ID. Because the
 // extension is store-hosted, policy force-install works on consumer machines
@@ -63,9 +64,10 @@ type DownloadService struct {
 	extFiles fs.FS  // bundled chromium extension files (for manual "Load unpacked")
 	keyDir   string // app data dir (also where the extension is extracted)
 
-	mu         sync.RWMutex
-	settings   config.Settings
-	pendingAdd AddPrefill
+	mu          sync.RWMutex
+	settings    config.Settings
+	pendingAdds map[string]AddPrefill // per-window prefill, keyed by the add window's unique name
+	addSeq      int64                 // monotonic counter for unique add-window names
 
 	clientMu sync.Mutex
 	clients  map[proxy.Settings]*http.Client // cached, proxy-aware clients keyed by task proxy settings
@@ -91,7 +93,7 @@ func New(dbPath string, extFiles fs.FS) (*DownloadService, error) {
 		st.Close()
 		return nil, err
 	}
-	s := &DownloadService{store: st, settings: settings, extFiles: extFiles, keyDir: filepath.Dir(dbPath)}
+	s := &DownloadService{store: st, settings: settings, extFiles: extFiles, keyDir: filepath.Dir(dbPath), pendingAdds: make(map[string]AddPrefill)}
 
 	s.engine = downloader.NewEngine(downloader.Config{
 		MaxConcurrent:  settings.MaxConcurrent,
@@ -273,37 +275,32 @@ func (s *DownloadService) ShowAddWindow(p AddPrefill) {
 	s.openAddWindow(p)
 }
 
-// ConsumePendingAdd returns and clears the prefill for the add window (called by
-// the add window when it loads).
-func (s *DownloadService) ConsumePendingAdd() AddPrefill {
+// ConsumePendingAdd returns and clears the prefill for a specific add window
+// (called by that window when it loads, identified by its unique name).
+func (s *DownloadService) ConsumePendingAdd(window string) AddPrefill {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := s.pendingAdd
-	s.pendingAdd = AddPrefill{}
+	p := s.pendingAdds[window]
+	delete(s.pendingAdds, window)
 	return p
 }
 
-// openAddWindow stores the prefill and shows the dedicated add window.
+// openAddWindow stores the prefill and shows a fresh, independent add-download
+// window. Every call creates its own uniquely-named window so any number of
+// downloads can run concurrently (IDM-style) — a completed window never blocks
+// a new one. Prefill is keyed by the window name so concurrent opens don't race.
 func (s *DownloadService) openAddWindow(p AddPrefill) {
 	s.mu.Lock()
-	s.pendingAdd = p
+	name := fmt.Sprintf("add-%d", atomic.AddInt64(&s.addSeq, 1))
+	s.pendingAdds[name] = p
 	s.mu.Unlock()
 
 	app := application.Get()
 	if app == nil {
 		return
 	}
-	if w, ok := app.Window.Get(AddWindowName); ok {
-		app.Event.Emit("add:reload", nil) // tell it to re-read the prefill
-		w.Restore()
-		w.Show()
-		w.SetAlwaysOnTop(true)
-		w.Focus()
-		go resetTopmost(w)
-		return
-	}
 	w := app.Window.NewWithOptions(application.WebviewWindowOptions{
-		Name:             AddWindowName,
+		Name:             name,
 		Title:            s.tr("添加下载", "Add Download"),
 		Width:            560,
 		Height:           500,
@@ -311,7 +308,7 @@ func (s *DownloadService) openAddWindow(p AddPrefill) {
 		MinHeight:        420,
 		AlwaysOnTop:      true,
 		BackgroundColour: application.NewRGB(245, 246, 248),
-		URL:              "/?view=add",
+		URL:              "/?view=add&w=" + name,
 	})
 	w.Show()
 	w.Focus()

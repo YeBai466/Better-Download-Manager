@@ -11,6 +11,11 @@ type ProxySettings = Settings["proxy"];
 
 const defaultProxy = { mode: "system", url: "", username: "", password: "" } as ProxySettings;
 
+// Each add-download window is opened with a unique name in the URL (?w=add-N);
+// the prefill is keyed by that name so concurrent windows don't read each
+// other's data.
+const winName = new URLSearchParams(window.location.search).get("w") ?? "";
+
 function cleanHeaders(input: { [_ in string]?: string } | null | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(input ?? {})) {
@@ -75,7 +80,7 @@ export default function AddPage() {
   }, [autoName, fillDir, headers, proxy]);
 
   const loadPrefill = useCallback(async (prefillProxy = proxy) => {
-    const p = await api.consumePendingAdd();
+    const p = await api.consumePendingAdd(winName);
     if (!p?.url) return;
     const nextHeaders = cleanHeaders(p.headers);
     setUrl(p.url);
@@ -102,8 +107,6 @@ export default function AddPage() {
       loadPrefill(nextProxy);
     });
     fillDir("");
-    const off = onEvent("add:reload", () => loadPrefill());
-    return off;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

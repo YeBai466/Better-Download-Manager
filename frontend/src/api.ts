@@ -37,7 +37,7 @@ export const api = {
   resolveSaveDir: (category: string) => DownloadService.ResolveSaveDir(category),
   showAddWindow: (p: { url?: string; filename?: string; headers?: Record<string, string> }) =>
     DownloadService.ShowAddWindow({ url: p.url ?? "", filename: p.filename ?? "", headers: p.headers ?? {} }),
-  consumePendingAdd: () => DownloadService.ConsumePendingAdd(),
+  consumePendingAdd: (window: string) => DownloadService.ConsumePendingAdd(window),
   checkForUpdates: () => DownloadService.CheckForUpdates(),
   downloadUpdate: (downloadUrl: string) => DownloadService.DownloadUpdate(downloadUrl),
   openURL: (url: string) => DownloadService.OpenURL(url),

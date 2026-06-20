@@ -163,11 +163,66 @@ func (t *Task) Snapshot() TaskInfo {
 		f := t.FinishedAt
 		info.FinishedAt = &f
 	}
-	info.Segments = make([]Segment, len(t.Segments))
-	for i, s := range t.Segments {
-		info.Segments[i] = Segment{Index: s.Index, Start: s.Start, End: s.End, Downloaded: s.loaded()}
+	// Per-thread display: with the work-stealing engine, t.Segments are workers
+	// (each stamped with the whole-file range), so dividing a worker's scattered
+	// bytes by the whole file would make every bar stall at its share. Present the
+	// threads as contiguous file regions derived from the real chunks, so each bar
+	// fills 0..100% as its region of the file completes (IDM-style).
+	if len(t.Chunks) > 0 {
+		n := len(t.Segments)
+		if n < 1 {
+			n = t.Connections
+		}
+		if n < 1 {
+			n = 1
+		}
+		info.Segments = displaySegmentsFromChunks(t.Chunks, n)
+	} else {
+		info.Segments = make([]Segment, len(t.Segments))
+		for i, s := range t.Segments {
+			info.Segments[i] = Segment{Index: s.Index, Start: s.Start, End: s.End, Downloaded: s.loaded()}
+		}
 	}
 	return info
+}
+
+// displaySegmentsFromChunks groups the ordered transfer chunks into n contiguous
+// UI lanes (file regions) for the per-thread progress display. Each lane's
+// Downloaded is the sum of its chunks' progress, so the frontend's
+// downloaded/(end-start+1) yields a true 0..100% fill as that region completes.
+func displaySegmentsFromChunks(chunks []*Chunk, n int) []Segment {
+	if n < 1 {
+		n = 1
+	}
+	if n > len(chunks) {
+		n = len(chunks)
+	}
+	if n < 1 {
+		return nil
+	}
+	segs := make([]Segment, n)
+	base := len(chunks) / n
+	rem := len(chunks) % n
+	start := 0
+	for i := 0; i < n; i++ {
+		size := base
+		if i < rem {
+			size++
+		}
+		group := chunks[start : start+size]
+		var downloaded int64
+		for _, c := range group {
+			downloaded += c.loaded()
+		}
+		segs[i] = Segment{
+			Index:      i,
+			Start:      group[0].Start,
+			End:        group[len(group)-1].End,
+			Downloaded: downloaded,
+		}
+		start += size
+	}
+	return segs
 }
 
 func (t *Task) setStatus(s Status, errMsg string) {

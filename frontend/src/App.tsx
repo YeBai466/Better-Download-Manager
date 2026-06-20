@@ -19,7 +19,7 @@ import UpdateDialog, { type UpdateInfo } from "./components/UpdateDialog";
 import { formatSpeed } from "./format";
 import { t, setLang, useLang } from "./i18n";
 
-const APP_VERSION = "1.1.1";
+const APP_VERSION = "1.1.2";
 
 export default function App() {
   useLang(); // re-render the whole tree when the language changes
