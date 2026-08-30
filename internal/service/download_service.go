@@ -47,7 +47,7 @@ const MainWindowName = "main"
 // number of downloads can have their own independent window (IDM-style).
 
 // Version is the application version reported to the browser extension.
-const Version = "1.1.2"
+const Version = "1.2.0"
 
 // StoreExtensionID is the published Chrome Web Store extension ID. Because the
 // extension is store-hosted, policy force-install works on consumer machines

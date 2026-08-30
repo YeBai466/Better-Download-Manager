@@ -33,7 +33,7 @@ Unicode true
 ####
 ## Pin the product version so the installer's metadata matches the app release.
 ####
-!define INFO_PRODUCTVERSION "1.1.2"
+!define INFO_PRODUCTVERSION "1.2.0"
 
 ####
 ## Include the wails tools
