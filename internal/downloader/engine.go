@@ -456,7 +456,46 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 		_ = writeMeta(t)
 		return xferErr
 	}
+	// Completeness gate. Workers only return nil once their chunk is full, so
+	// reaching here should imply a whole file — but that is derived, not
+	// checked. Verify it explicitly: a silently truncated or hole-punched
+	// "completed" file is the worst failure this engine can produce, and the
+	// check costs one in-memory pass plus a Stat.
+	if err := verifyComplete(t); err != nil {
+		w.Close()
+		_ = writeMeta(t)
+		return err
+	}
 	return finalize(w, t.SavePath)
+}
+
+// verifyComplete reports whether every planned byte was actually fetched.
+func verifyComplete(t *Task) error {
+	t.mu.RLock()
+	total := t.TotalSize
+	chunks := append([]*Chunk(nil), t.Chunks...)
+	savePath := t.SavePath
+	t.mu.RUnlock()
+	if total <= 0 {
+		return nil // unknown length: the stream's EOF is the only authority
+	}
+	var got int64
+	for _, c := range chunks {
+		if c == nil {
+			continue
+		}
+		if !c.Complete() {
+			return fmt.Errorf("incomplete transfer: chunk %d has %d/%d bytes", c.Index, c.loaded(), c.size())
+		}
+		got += c.loaded()
+	}
+	if got != total {
+		return fmt.Errorf("incomplete transfer: %d of %d bytes", got, total)
+	}
+	if info, err := os.Stat(partPath(savePath)); err == nil && info.Size() != total {
+		return fmt.Errorf("partial file is %d bytes, expected %d", info.Size(), total)
+	}
+	return nil
 }
 
 // loadResume validates saved byte ranges before allowing a ranged resume.

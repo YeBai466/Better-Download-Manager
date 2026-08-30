@@ -48,6 +48,7 @@ type urlHolder struct {
 	headers   map[string]string
 	gen       int
 	refreshes int
+	inflight  chan struct{} // non-nil while a refresh is running
 }
 
 // maxURLRefreshes bounds origin re-resolution so a permanently broken signed
@@ -77,58 +78,87 @@ func (h *urlHolder) refreshable(gen int) bool {
 }
 
 // refresh re-resolves the origin URL after a worker saw an auth-style
-// rejection on the shared URL. Single-flight: a worker that raced an already
-// completed refresh just picks up the new URL on its next attempt.
+// rejection on the shared URL. It is single-flight: when N workers hit the
+// same expiry at once, exactly ONE re-resolves the origin and the others wait
+// for it and then reuse the new URL. Without that, one expiry event would fire
+// N origin requests and burn the whole refresh budget instantly.
 func (h *urlHolder) refresh(ctx context.Context, client *http.Client, gen int, id responseIdentity) error {
 	h.mu.Lock()
-	if h.gen != gen { // someone refreshed after this worker fetched the URL
+	for {
+		if h.gen != gen { // someone already refreshed past the URL we used
+			h.mu.Unlock()
+			return nil
+		}
+		if h.inflight == nil {
+			break
+		}
+		// Another worker is refreshing this same generation — wait it out.
+		wait := h.inflight
 		h.mu.Unlock()
-		return nil
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wait:
+		}
+		h.mu.Lock()
 	}
 	if h.refreshes >= maxURLRefreshes {
 		h.mu.Unlock()
 		return fatalError{fmt.Errorf("download URL kept expiring after %d refreshes", h.refreshes)}
 	}
 	h.refreshes++
+	done := make(chan struct{})
+	h.inflight = done
 	origin := h.origin
 	headers := h.headers
 	h.mu.Unlock()
 
+	fresh, err := resolveFreshURL(ctx, client, origin, headers, id)
+
+	h.mu.Lock()
+	if err == nil {
+		h.current = fresh
+		h.gen++
+	}
+	h.inflight = nil
+	h.mu.Unlock()
+	close(done) // wake the waiters, successfully refreshed or not
+	return err
+}
+
+// resolveFreshURL re-walks the origin's redirect chain and verifies the target
+// still serves the same representation.
+func resolveFreshURL(ctx context.Context, client *http.Client, origin string, headers map[string]string, id responseIdentity) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	applyHeaders(req, headers)
 	req.Header.Set("Range", "bytes=0-0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
 		resp.Body.Close()
 	}()
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("origin returned %s during URL refresh", resp.Status)
+		return "", fmt.Errorf("origin returned %s during URL refresh", resp.Status)
 	}
 	// The refreshed target must still serve the same representation.
 	if resp.StatusCode == http.StatusPartialContent {
 		if _, _, total, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && total > 0 && id.TotalSize > 0 && total != id.TotalSize {
-			return identityChangedError{fmt.Errorf("remote size changed during URL refresh: got %d want %d", total, id.TotalSize)}
+			return "", identityChangedError{fmt.Errorf("remote size changed during URL refresh: got %d want %d", total, id.TotalSize)}
 		}
 	}
 	if id.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != id.ETag {
-		return identityChangedError{fmt.Errorf("remote content changed during URL refresh")}
+		return "", identityChangedError{fmt.Errorf("remote content changed during URL refresh")}
 	}
-	fresh := origin
 	if resp.Request != nil && resp.Request.URL != nil {
-		fresh = resp.Request.URL.String()
+		return resp.Request.URL.String(), nil
 	}
-	h.mu.Lock()
-	h.current = fresh
-	h.gen++
-	h.mu.Unlock()
-	return nil
+	return origin, nil
 }
 
 // chunkQueue hands chunks to workers. While holdLowest is set, the lowest
@@ -269,7 +299,13 @@ func downloadChunkWithRetry(
 		retries = defaultRetries
 	}
 	var last error
-	for attempt := 0; attempt <= retries; attempt++ {
+	// Progress resets the retry budget (below), so bound the total attempts
+	// too: a server dripping a handful of bytes per connection would
+	// otherwise keep one worker requesting forever.
+	for attempt, total := 0, 0; attempt <= retries; attempt, total = attempt+1, total+1 {
+		if total > maxChunkAttempts {
+			return fmt.Errorf("chunk %d made too little progress after %d attempts: %w", chunk.Index, total, last)
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -565,6 +601,10 @@ func copyBody(
 				if err := opts.Limiter.Wait(ctx, n); err != nil {
 					return err
 				}
+				// Time spent sleeping in OUR rate limiter is not a server
+				// stall — re-stamp so a low speed limit can't make the
+				// watchdog kill a perfectly healthy throttled transfer.
+				lastProgressUnix.Store(time.Now().UnixNano())
 			}
 			if _, werr := w.WriteAt(readBuf[:n], offset); werr != nil {
 				return werr
@@ -754,10 +794,17 @@ func copyBufferSize(l *speedLimiter) int {
 	rate := l.rate
 	l.mu.Unlock()
 	if rate > 0 {
-		if rate < 64*1024 {
-			return 16 * 1024
+		// Keep one buffer worth of data under ~0.5s of the limit, so throttled
+		// transfers stay responsive to pause and the progress readout doesn't
+		// move in coarse jumps.
+		size := int(rate / 2)
+		if size < 4*1024 {
+			size = 4 * 1024
 		}
-		return 64 * 1024
+		if size > 64*1024 {
+			size = 64 * 1024
+		}
+		return size
 	}
 	return 256 * 1024
 }

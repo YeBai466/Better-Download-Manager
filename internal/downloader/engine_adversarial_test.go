@@ -5,6 +5,7 @@ package downloader
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -592,5 +593,115 @@ func TestResumeValidationNetworkFailureKeepsPartial(t *testing.T) {
 	}
 	if _, err := os.Stat(metaPath(dst)); err != nil {
 		t.Fatalf("resume metadata was destroyed by a failed resume check: %v", err)
+	}
+}
+
+// TestSilentTruncationIsRejected: a server that ends the body early on the
+// LAST chunk (declared length, short delivery, clean close each time) must
+// never yield a "completed" task with a short file.
+func TestSilentTruncationIsRejected(t *testing.T) {
+	data := makeData(12 << 20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, e, ok := parseRange(r.Header.Get("Range"), len(data))
+		if !ok {
+			s, e = 0, len(data)-1
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", itoa(e-s+1))
+		if ok {
+			w.Header().Set("Content-Range", "bytes "+itoa(s)+"-"+itoa(e)+"/"+itoa(len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		end := e + 1
+		if e == len(data)-1 {
+			end -= 16 // never deliver the last 16 bytes of the file
+		}
+		if end > s {
+			_, _ = w.Write(data[s:end])
+		}
+	}))
+	defer srv.Close()
+
+	updates := make(chan TaskInfo, 512)
+	e := newTestEngineCfg(updates, func(c *Config) { c.Retries = 1 })
+	defer e.Shutdown()
+
+	dst := filepath.Join(t.TempDir(), "out.bin")
+	if _, err := e.Add(AddOptions{ID: "t1", URL: srv.URL, SavePath: dst, Connections: 4, AutoStart: true}); err != nil {
+		t.Fatal(err)
+	}
+	info := waitForStatus(t, updates, StatusCompleted, StatusError)
+	if info.Status == StatusCompleted {
+		st, serr := os.Stat(dst)
+		t.Fatalf("task reported completed on a truncated download (file=%v err=%v)", st.Size(), serr)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		t.Fatalf("a truncated download must not be published as the final file")
+	}
+}
+
+// TestURLRefreshIsSingleFlight: when N workers hit the same expired signed URL
+// at once, exactly ONE must re-resolve the origin. Otherwise a single expiry
+// event fires N origin requests and instantly burns the refresh budget,
+// failing the download.
+func TestURLRefreshIsSingleFlight(t *testing.T) {
+	var originHits int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&originHits, 1)
+		time.Sleep(30 * time.Millisecond) // widen the window for the racers
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", "1")
+		w.Header().Set("Content-Range", "bytes 0-0/1024")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte{0})
+	}))
+	defer srv.Close()
+
+	h := newURLHolder(srv.URL+"/signed?tok=old", srv.URL, nil)
+	_, gen := h.get()
+	id := responseIdentity{TotalSize: 1024}
+
+	const workers = 8
+	errs := make(chan error, workers)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			errs <- h.refresh(context.Background(), srv.Client(), gen, id)
+		}()
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("worker %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt64(&originHits); got != 1 {
+		t.Fatalf("not single-flight: %d origin requests for one expiry event", got)
+	}
+	if h.refreshes != 1 {
+		t.Fatalf("refresh budget consumed %d times for one expiry event", h.refreshes)
+	}
+}
+
+// TestConnectionLimiterNoLeakOnCancel: Acquire must hold no slot when it
+// reports an error. Leaking on a cancelled context (pause/remove) would
+// permanently shrink the global connection budget until the app restarts.
+func TestConnectionLimiterNoLeakOnCancel(t *testing.T) {
+	for trial := 0; trial < 500; trial++ {
+		l := newConnectionLimiter(1)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := l.Acquire(ctx); err != nil && len(l.ch) != 0 {
+			t.Fatalf("trial %d: Acquire failed but kept a slot (%d held)", trial, len(l.ch))
+		}
+	}
+	// A cancelled Acquire must leave the limiter fully usable.
+	l := newConnectionLimiter(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = l.Acquire(ctx)
+	if err := l.Acquire(context.Background()); err != nil {
+		t.Fatalf("limiter starved after a cancelled Acquire: %v", err)
 	}
 }

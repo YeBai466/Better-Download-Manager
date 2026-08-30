@@ -10,7 +10,12 @@ const (
 	// defaultRetries is per chunk and only counts attempts that made no
 	// forward progress (see downloadChunkWithRetry), so it can stay small
 	// without giving up on flaky-but-alive connections.
-	defaultRetries      = 4
+	defaultRetries = 4
+	// maxChunkAttempts bounds a single chunk's total attempts. Forward
+	// progress resets the retry budget, which is what lets a flaky-but-alive
+	// connection finish; this cap is the backstop against a server that
+	// dribbles a few bytes per request forever.
+	maxChunkAttempts    = 200
 	defaultStallTimeout = 30 * time.Second
 	defaultMetaInterval = 2 * time.Second
 	smallChunkSize      = int64(2 << 20)   // 2 MiB
@@ -175,13 +180,20 @@ func newConnectionLimiter(n int) *connectionLimiter {
 	return &connectionLimiter{ch: make(chan struct{}, n)}
 }
 
+// Acquire takes a connection slot. On error no slot is held: winning the send
+// race against an already-cancelled context must not leak the slot, since the
+// caller skips its deferred Release when Acquire fails.
 func (l *connectionLimiter) Acquire(ctx context.Context) error {
 	if l == nil {
 		return ctx.Err()
 	}
 	select {
 	case l.ch <- struct{}{}:
-		return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			l.Release()
+			return err
+		}
+		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
