@@ -640,6 +640,13 @@ func copyBody(
 
 // buildTransferPlan creates UI lanes and resumable chunks. The UI lane count is
 // the worker count; chunks are smaller work units consumed dynamically.
+//
+// Chunks taper toward the end of the file. Workers exit as soon as the queue is
+// empty, so whatever remains of the last claimed chunk finishes on a single
+// connection while the others idle. With uniform 16 MiB chunks that endgame tail
+// costs roughly a tenth of the total time on a 1 GiB download; sizing the final
+// region smaller bounds the tail without paying extra round-trips over the bulk
+// of the file.
 func buildTransferPlan(totalSize int64, requested int) transferPlan {
 	workers := smartConnections(totalSize, requested)
 	if totalSize <= 0 {
@@ -656,9 +663,15 @@ func buildTransferPlan(totalSize int64, requested int) transferPlan {
 		workers = 1
 	}
 	chunkSize := smartChunkSize(totalSize)
-	chunks := make([]*Chunk, 0, (totalSize/chunkSize)+1)
+	tailChunk, tailStart := tailPlan(totalSize, chunkSize, workers)
+
+	chunks := make([]*Chunk, 0, (totalSize/chunkSize)+(chunkSize/tailChunk)+2)
 	for start, idx := int64(0), 0; start < totalSize; idx++ {
-		end := start + chunkSize - 1
+		size := chunkSize
+		if start >= tailStart {
+			size = tailChunk
+		}
+		end := start + size - 1
 		if end >= totalSize {
 			end = totalSize - 1
 		}
@@ -667,6 +680,30 @@ func buildTransferPlan(totalSize int64, requested int) transferPlan {
 	}
 	lanes := buildWorkerLanes(totalSize, workers)
 	return transferPlan{workers: workers, chunks: chunks, lanes: lanes}
+}
+
+// tailPlan returns the smaller chunk size used for the end of the file and the
+// offset where it starts. Single-worker transfers keep uniform chunks — there is
+// no idle connection to starve.
+func tailPlan(totalSize, chunkSize int64, workers int) (tailChunk, tailStart int64) {
+	if workers < 2 || chunkSize <= minTailChunk {
+		return chunkSize, totalSize
+	}
+	tailChunk = chunkSize / 4
+	if tailChunk < minTailChunk {
+		tailChunk = minTailChunk
+	}
+	// One partial round of work is enough to absorb the stagger between
+	// workers finishing.
+	tailZone := chunkSize * int64(workers) / 2
+	if tailZone > totalSize/4 {
+		tailZone = totalSize / 4
+	}
+	tailStart = totalSize - tailZone
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	return tailChunk, tailStart
 }
 
 func buildWorkerLanes(totalSize int64, n int) []*Segment {

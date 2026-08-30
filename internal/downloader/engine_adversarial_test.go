@@ -705,3 +705,53 @@ func TestConnectionLimiterNoLeakOnCancel(t *testing.T) {
 		t.Fatalf("limiter starved after a cancelled Acquire: %v", err)
 	}
 }
+
+// TestTransferPlanTapersTail: workers exit as soon as the chunk queue is empty,
+// so a uniformly-chunked plan ends with one connection grinding through a full
+// chunk while the rest idle. The plan must taper toward the end of the file to
+// bound that endgame tail.
+func TestTransferPlanTapersTail(t *testing.T) {
+	const total = int64(1 << 30) // 1 GiB -> 16 MiB chunks
+	plan := buildTransferPlan(total, 8)
+	if plan.workers != 8 {
+		t.Fatalf("workers=%d want 8", plan.workers)
+	}
+	if len(plan.chunks) < 2 {
+		t.Fatalf("expected many chunks, got %d", len(plan.chunks))
+	}
+
+	first := plan.chunks[0].size()
+	last := plan.chunks[len(plan.chunks)-1].size()
+	if last > first/2 {
+		t.Fatalf("tail not tapered: first chunk %d bytes, last %d", first, last)
+	}
+
+	// Contiguity and coverage must survive the taper.
+	var covered int64
+	for i, c := range plan.chunks {
+		if c.Start != covered {
+			t.Fatalf("chunk %d starts at %d, expected %d (gap or overlap)", i, c.Start, covered)
+		}
+		if c.End < c.Start {
+			t.Fatalf("chunk %d is empty: %d-%d", i, c.Start, c.End)
+		}
+		covered = c.End + 1
+	}
+	if covered != total {
+		t.Fatalf("plan covers %d of %d bytes", covered, total)
+	}
+
+	// The worst-case single-connection tail is one chunk; keep it small
+	// relative to the file.
+	if last > total/128 {
+		t.Fatalf("tail chunk %d bytes is too large for a %d byte file", last, total)
+	}
+
+	// A single-worker plan has no idle connection to starve: keep it uniform.
+	solo := buildTransferPlan(4<<20, 1)
+	for i, c := range solo.chunks[:len(solo.chunks)-1] {
+		if c.size() != solo.chunks[0].size() {
+			t.Fatalf("single-worker plan should stay uniform, chunk %d differs", i)
+		}
+	}
+}

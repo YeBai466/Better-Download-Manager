@@ -19,6 +19,7 @@ const (
 	defaultStallTimeout = 30 * time.Second
 	defaultMetaInterval = 2 * time.Second
 	smallChunkSize      = int64(2 << 20)   // 2 MiB
+	minTailChunk        = int64(1 << 20)   // 1 MiB, floor for end-of-file chunks
 	defaultChunkSize    = int64(8 << 20)   // 8 MiB
 	largeFileChunkSize  = int64(16 << 20)  // 16 MiB
 	smallFileThreshold  = int64(8 << 20)   // 8 MiB
