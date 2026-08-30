@@ -37,6 +37,11 @@ func (w *fileWriter) WriteAt(p []byte, off int64) (int, error) {
 func (w *fileWriter) Sync() error  { return w.f.Sync() }
 func (w *fileWriter) Close() error { return w.f.Close() }
 
+// Truncate discards previously written bytes (fresh start over a stale .part,
+// or a no-range stream restarting from zero). Shrinking is cheap on Windows —
+// only preallocation (growing) is slow, see openPartFile.
+func (w *fileWriter) Truncate(n int64) error { return w.f.Truncate(n) }
+
 // removePartial deletes the .part file for a target path, if present.
 func removePartial(savePath string) {
 	_ = os.Remove(partPath(savePath))

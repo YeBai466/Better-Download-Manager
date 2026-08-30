@@ -7,10 +7,13 @@ import (
 )
 
 const (
-	defaultRetries      = 3
+	// defaultRetries is per chunk and only counts attempts that made no
+	// forward progress (see downloadChunkWithRetry), so it can stay small
+	// without giving up on flaky-but-alive connections.
+	defaultRetries      = 4
 	defaultStallTimeout = 30 * time.Second
 	defaultMetaInterval = 2 * time.Second
-	minChunkSize        = int64(1 << 20)   // 1 MiB
+	smallChunkSize      = int64(2 << 20)   // 2 MiB
 	defaultChunkSize    = int64(8 << 20)   // 8 MiB
 	largeFileChunkSize  = int64(16 << 20)  // 16 MiB
 	smallFileThreshold  = int64(8 << 20)   // 8 MiB
@@ -49,6 +52,10 @@ func normalizeRuntimeConfig(c RuntimeConfig) RuntimeConfig {
 	return c
 }
 
+// smartConnections scales the worker count with file size. Tiny files finish
+// before extra connections would ramp up; anything bigger gets enough
+// connections to fill a high-bandwidth-delay-product link (IDM uses 8 across
+// the board — we only hold back where setup cost would dominate).
 func smartConnections(total int64, requested int) int {
 	if requested < 1 {
 		requested = DefaultConnections
@@ -60,9 +67,9 @@ func smartConnections(total int64, requested int) int {
 	case total < smallFileThreshold:
 		return 1
 	case total < mediumFileThreshold:
-		return minInt(requested, 2)
-	case total < largeFileThreshold:
 		return minInt(requested, 4)
+	case total < largeFileThreshold:
+		return minInt(requested, 8)
 	default:
 		return requested
 	}
@@ -73,7 +80,7 @@ func smartChunkSize(total int64) int64 {
 	case total <= 0:
 		return defaultChunkSize
 	case total < mediumFileThreshold:
-		return minChunkSize
+		return smallChunkSize
 	case total < largeFileThreshold:
 		return defaultChunkSize
 	default:
@@ -108,6 +115,11 @@ func (l *speedLimiter) Wait(ctx context.Context, n int) error {
 	if l == nil || n <= 0 {
 		return ctx.Err()
 	}
+	// Consume the debt in pieces: the allowance is capped at one second of
+	// rate, so a single read larger than that cap could otherwise never be
+	// satisfied and this would spin forever (e.g. a 128 KiB read against a
+	// 64 KiB/s limit set mid-transfer).
+	remaining := float64(n)
 	for {
 		l.mu.Lock()
 		rate := l.rate
@@ -122,12 +134,20 @@ func (l *speedLimiter) Wait(ctx context.Context, n int) error {
 		if cap := float64(rate); l.allowance > cap {
 			l.allowance = cap
 		}
-		if l.allowance >= float64(n) {
-			l.allowance -= float64(n)
+		take := remaining
+		if take > l.allowance {
+			take = l.allowance
+		}
+		l.allowance -= take
+		remaining -= take
+		if remaining <= 0 {
 			l.mu.Unlock()
 			return ctx.Err()
 		}
-		need := float64(n) - l.allowance
+		need := remaining
+		if cap := float64(rate); need > cap {
+			need = cap
+		}
 		wait := time.Duration(need / float64(rate) * float64(time.Second))
 		if wait < 10*time.Millisecond {
 			wait = 10 * time.Millisecond
@@ -153,13 +173,6 @@ func newConnectionLimiter(n int) *connectionLimiter {
 		n = DefaultConnections
 	}
 	return &connectionLimiter{ch: make(chan struct{}, n)}
-}
-
-func (l *connectionLimiter) Resize(n int) {
-	if n < 1 {
-		n = DefaultConnections
-	}
-	l.ch = make(chan struct{}, n)
 }
 
 func (l *connectionLimiter) Acquire(ctx context.Context) error {

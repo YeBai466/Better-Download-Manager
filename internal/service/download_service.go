@@ -69,6 +69,11 @@ type DownloadService struct {
 	pendingAdds map[string]AddPrefill // per-window prefill, keyed by the add window's unique name
 	addSeq      int64                 // monotonic counter for unique add-window names
 
+	// pathMu serializes save-path selection + task registration so two
+	// concurrent AddURL calls can never pick the same path and interleave
+	// writes into one .part file.
+	pathMu sync.Mutex
+
 	clientMu sync.Mutex
 	clients  map[proxy.Settings]*http.Client // cached, proxy-aware clients keyed by task proxy settings
 }
@@ -170,10 +175,21 @@ func (s *DownloadService) newClientForProxy(p proxy.Settings) *http.Client {
 	}
 	c, err := httpclient.New(p)
 	if err != nil {
-		return &http.Client{}
+		// Never fall back to a default direct client: that would silently
+		// bypass the user's proxy. Surface the config error on every request
+		// instead, so the task fails visibly with the actual cause.
+		return &http.Client{Transport: errorTransport{err: err}}
 	}
 	s.clients[p] = c
 	return c
+}
+
+// errorTransport fails every request with the proxy-configuration error that
+// prevented building a real client.
+type errorTransport struct{ err error }
+
+func (t errorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("代理配置无效: %w", t.err)
 }
 
 // invalidateClient drops the cached client so the next download rebuilds it with
@@ -241,7 +257,6 @@ func (s *DownloadService) AddURL(req AddRequest) (downloader.TaskInfo, error) {
 	if saveDir == "" {
 		saveDir = s.resolveDir(category)
 	}
-	savePath := uniquePath(filepath.Join(saveDir, filename))
 
 	conns := req.Connections
 	if conns < 1 {
@@ -256,10 +271,16 @@ func (s *DownloadService) AddURL(req AddRequest) (downloader.TaskInfo, error) {
 		}
 	}
 
+	// Path selection and registration must be atomic: uniquePath's stat checks
+	// alone are a TOCTOU race between two adds of the same filename.
+	s.pathMu.Lock()
+	defer s.pathMu.Unlock()
+	savePath := s.uniqueSavePath(filepath.Join(saveDir, filename))
+
 	return s.engine.Add(downloader.AddOptions{
 		ID:          newID(),
 		URL:         req.URL,
-		Filename:    filename,
+		Filename:    filepath.Base(savePath),
 		SavePath:    savePath,
 		Category:    category,
 		Connections: conns,
@@ -267,6 +288,37 @@ func (s *DownloadService) AddURL(req AddRequest) (downloader.TaskInfo, error) {
 		Proxy:       taskProxy,
 		AutoStart:   req.AutoStart,
 	})
+}
+
+// uniqueSavePath picks a path not used by any file on disk (final, .part or
+// .bdmeta artifacts) nor by any registered task. Caller must hold s.pathMu.
+func (s *DownloadService) uniqueSavePath(path string) string {
+	active := map[string]bool{}
+	for _, t := range s.engine.List() {
+		active[strings.ToLower(filepath.Clean(t.SavePath))] = true
+	}
+	occupied := func(p string) bool {
+		if active[strings.ToLower(filepath.Clean(p))] {
+			return true
+		}
+		for _, probe := range []string{p, downloader.PartPath(p), downloader.MetaPath(p)} {
+			if _, err := os.Stat(probe); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	if !occupied(path) {
+		return path
+	}
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+		if !occupied(candidate) {
+			return candidate
+		}
+	}
 }
 
 // ShowAddWindow opens (or focuses) the separate add-download window, prefilled
@@ -849,19 +901,4 @@ func filenameFromURL(rawURL string) string {
 		return "download"
 	}
 	return base
-}
-
-// uniquePath appends " (n)" before the extension if the path already exists.
-func uniquePath(path string) string {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return path
-	}
-	ext := filepath.Ext(path)
-	base := strings.TrimSuffix(path, ext)
-	for i := 1; ; i++ {
-		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
-		}
-	}
 }

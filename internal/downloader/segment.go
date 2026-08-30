@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,33 +37,223 @@ type responseIdentity struct {
 	TotalSize    int64
 }
 
+// urlHolder shares the resolved request URL between chunk workers so ranged
+// requests hit the redirect target directly instead of re-walking the redirect
+// chain once per chunk — while still being able to refresh an expired signed
+// URL (S3/CDN style) by re-resolving the origin.
+type urlHolder struct {
+	mu        sync.Mutex
+	current   string
+	origin    string
+	headers   map[string]string
+	gen       int
+	refreshes int
+}
+
+// maxURLRefreshes bounds origin re-resolution so a permanently broken signed
+// URL can't loop forever.
+const maxURLRefreshes = 4
+
+func newURLHolder(current, origin string, headers map[string]string) *urlHolder {
+	if current == "" {
+		current = origin
+	}
+	return &urlHolder{current: current, origin: origin, headers: headers}
+}
+
+func (h *urlHolder) get() (string, int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.current, h.gen
+}
+
+// refreshable reports whether a rejected URL can be re-resolved: either the
+// URL came from a redirect (the origin can hand out a fresh one) or another
+// worker already refreshed since gen was read.
+func (h *urlHolder) refreshable(gen int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.gen != gen || h.current != h.origin
+}
+
+// refresh re-resolves the origin URL after a worker saw an auth-style
+// rejection on the shared URL. Single-flight: a worker that raced an already
+// completed refresh just picks up the new URL on its next attempt.
+func (h *urlHolder) refresh(ctx context.Context, client *http.Client, gen int, id responseIdentity) error {
+	h.mu.Lock()
+	if h.gen != gen { // someone refreshed after this worker fetched the URL
+		h.mu.Unlock()
+		return nil
+	}
+	if h.refreshes >= maxURLRefreshes {
+		h.mu.Unlock()
+		return fatalError{fmt.Errorf("download URL kept expiring after %d refreshes", h.refreshes)}
+	}
+	h.refreshes++
+	origin := h.origin
+	headers := h.headers
+	h.mu.Unlock()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin, nil)
+	if err != nil {
+		return err
+	}
+	applyHeaders(req, headers)
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("origin returned %s during URL refresh", resp.Status)
+	}
+	// The refreshed target must still serve the same representation.
+	if resp.StatusCode == http.StatusPartialContent {
+		if _, _, total, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && total > 0 && id.TotalSize > 0 && total != id.TotalSize {
+			return identityChangedError{fmt.Errorf("remote size changed during URL refresh: got %d want %d", total, id.TotalSize)}
+		}
+	}
+	if id.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != id.ETag {
+		return identityChangedError{fmt.Errorf("remote content changed during URL refresh")}
+	}
+	fresh := origin
+	if resp.Request != nil && resp.Request.URL != nil {
+		fresh = resp.Request.URL.String()
+	}
+	h.mu.Lock()
+	h.current = fresh
+	h.gen++
+	h.mu.Unlock()
+	return nil
+}
+
+// chunkQueue hands chunks to workers. While holdLowest is set, the lowest
+// unclaimed chunk is reserved for the fast-start streamer, which extends its
+// already-open whole-file response through contiguous chunks instead of paying
+// a request round-trip (and often a fresh connection) per chunk.
 type chunkQueue struct {
-	mu     sync.Mutex
-	chunks []*Chunk
-	next   int
+	mu         sync.Mutex
+	chunks     []*Chunk
+	claimed    []bool
+	holdLowest bool
 }
 
-func newChunkQueue(chunks []*Chunk) *chunkQueue {
-	return &chunkQueue{chunks: chunks}
+func newChunkQueue(chunks []*Chunk, holdLowest bool) *chunkQueue {
+	return &chunkQueue{chunks: chunks, claimed: make([]bool, len(chunks)), holdLowest: holdLowest}
 }
 
+// nextChunk hands out the next unclaimed incomplete chunk for a ranged worker,
+// skipping the streamer's reserved (lowest) chunk unless it is the only work
+// left — a worker should steal it rather than idle while the streamer crawls.
 func (q *chunkQueue) nextChunk() *Chunk {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for q.next < len(q.chunks) {
-		c := q.chunks[q.next]
-		q.next++
-		if !c.Complete() {
-			return c
+	first := -1
+	for i, c := range q.chunks {
+		if q.claimed[i] || c.Complete() {
+			continue
 		}
+		if first == -1 {
+			first = i
+			if !q.holdLowest {
+				break
+			}
+			continue
+		}
+		q.claimed[i] = true
+		return q.chunks[i]
 	}
+	if first == -1 {
+		return nil
+	}
+	q.holdLowest = false // reserved chunk was the only one left; release it
+	q.claimed[first] = true
+	return q.chunks[first]
+}
+
+// nextContiguous claims the reserved lowest chunk iff it starts exactly where
+// the streamer's open response is positioned; otherwise streaming mode ends.
+func (q *chunkQueue) nextContiguous(pos int64) *Chunk {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.holdLowest {
+		return nil
+	}
+	for i, c := range q.chunks {
+		if q.claimed[i] || c.Complete() {
+			continue
+		}
+		if c.Start == pos {
+			q.claimed[i] = true
+			return q.chunks[i]
+		}
+		break
+	}
+	q.holdLowest = false
 	return nil
 }
+
+func (q *chunkQueue) streamerDone() {
+	q.mu.Lock()
+	q.holdLowest = false
+	q.mu.Unlock()
+}
+
+// transientStatusError marks an HTTP status worth retrying (408/429/5xx),
+// optionally carrying the server's Retry-After hint.
+type transientStatusError struct {
+	status     string
+	retryAfter time.Duration
+}
+
+func (e transientStatusError) Error() string { return "server returned " + e.status }
+
+func isTransientStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// isAuthExpiryStatus covers the statuses expiring signed URLs produce.
+func isAuthExpiryStatus(code int) bool {
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+		return true
+	}
+	return false
+}
+
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := time.ParseDuration(strings.TrimSpace(v) + "s"); err == nil && secs > 0 {
+		return secs
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// maxRetryAfterWait caps honoring Retry-After so a hostile header can't park a
+// worker for an hour.
+const maxRetryAfterWait = 30 * time.Second
 
 func downloadChunkWithRetry(
 	ctx context.Context,
 	client *http.Client,
-	rawURL string,
+	holder *urlHolder,
 	headers map[string]string,
 	chunk *Chunk,
 	lane *Segment,
@@ -83,23 +274,34 @@ func downloadChunkWithRetry(
 			return err
 		}
 		start := chunk.Current()
-		err := downloadChunk(ctx, client, rawURL, headers, chunk, lane, w, progress, opts)
+		err := downloadChunk(ctx, client, holder, headers, chunk, lane, w, progress, opts)
 		if err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if isFatalDownloadError(err) {
+		if isFatalDownloadError(err) || isIdentityChanged(err) {
 			return err
 		}
+		last = err
 		if chunk.Current() > start {
-			last = err
+			// Forward progress was made: a connection that keeps delivering
+			// bytes must never exhaust the retry budget, no matter how often
+			// the server drops it (IDM behavior). The budget only counts
+			// attempts that got nothing.
+			attempt = -1
 			continue
 		}
-		last = err
 		if attempt < retries {
 			delay := retryDelay(attempt)
+			var tse transientStatusError
+			if errors.As(err, &tse) && tse.retryAfter > delay {
+				delay = tse.retryAfter
+				if delay > maxRetryAfterWait {
+					delay = maxRetryAfterWait
+				}
+			}
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -127,7 +329,7 @@ func downloadSegment(
 	if ranged {
 		chunk := &Chunk{Index: seg.Index, Start: seg.Start, End: seg.End, Downloaded: seg.loaded()}
 		opts := transferOptions{Retries: defaultRetries, StallTimeout: defaultStallTimeout, Identity: responseIdentity{TotalSize: seg.End + 1}}
-		return downloadChunkWithRetry(ctx, client, rawURL, headers, chunk, seg, w, progress, opts)
+		return downloadChunkWithRetry(ctx, client, newURLHolder(rawURL, rawURL, headers), headers, chunk, seg, w, progress, opts)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -147,7 +349,7 @@ func downloadSegment(
 }
 
 // streamSegment is kept for the legacy fast-start path; new downloads use
-// streamOpenResponse directly with Chunk state.
+// streamChunks / copyBody directly with Chunk state.
 func streamSegment(
 	ctx context.Context,
 	resp *http.Response,
@@ -163,7 +365,7 @@ func streamSegment(
 func downloadChunk(
 	ctx context.Context,
 	client *http.Client,
-	rawURL string,
+	holder *urlHolder,
 	headers map[string]string,
 	chunk *Chunk,
 	lane *Segment,
@@ -183,14 +385,15 @@ func downloadChunk(
 	localOpts := opts
 	localOpts.Cancel = cancel
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+	url, gen := holder.get()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 	applyHeaders(req, headers)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", chunk.Current(), chunk.End))
-	if opts.Identity.ETag != "" || opts.Identity.LastModified != "" {
-		req.Header.Set("If-Range", ifRangeValue(opts.Identity))
+	if v := ifRangeValue(opts.Identity); v != "" {
+		req.Header.Set("If-Range", v)
 	}
 
 	resp, err := client.Do(req)
@@ -199,16 +402,79 @@ func downloadChunk(
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-		return fatalError{err: fmt.Errorf("server rejected range for chunk %d: %s", chunk.Index, resp.Status)}
-	}
-	if resp.StatusCode != http.StatusPartialContent {
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
+		// validated below
+	case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		// Our ranges were computed against the advertised size; 416 means the
+		// remote representation shrank or was replaced.
+		return identityChangedError{fmt.Errorf("server no longer satisfies range for chunk %d (%s)", chunk.Index, resp.Status)}
+	case resp.StatusCode == http.StatusOK && req.Header.Get("If-Range") != "":
+		// If-Range validator no longer matches: the remote file was replaced.
+		return identityChangedError{fmt.Errorf("remote content changed (validator mismatch on chunk %d)", chunk.Index)}
+	case isTransientStatus(resp.StatusCode):
+		return transientStatusError{status: resp.Status, retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	case isAuthExpiryStatus(resp.StatusCode) && holder.refreshable(gen):
+		// Likely an expired signed URL: re-resolve through the origin, then
+		// let the retry loop try again against the fresh target.
+		if rerr := holder.refresh(ctx, client, gen, opts.Identity); rerr != nil {
+			return rerr
+		}
+		return transientStatusError{status: resp.Status}
+	default:
 		return fatalError{err: fmt.Errorf("expected 206 Partial Content, got %s", resp.Status)}
 	}
 	if err := validatePartialResponse(resp, chunk.Current(), chunk.End, opts.Identity); err != nil {
-		return fatalError{err: err}
+		return err
 	}
 	return copyBody(reqCtx, resp.Body, chunk.Current(), chunk, lane, w, progress, localOpts, true)
+}
+
+// streamChunks consumes consecutive chunks from an already-open whole-file
+// response over a single connection. The queue reserves the lowest unclaimed
+// chunk for us, so while the transfer is healthy the fast-start connection
+// keeps streaming the file front with zero extra round-trips; ranged workers
+// chew through the rest and both meet in the middle. On a mid-stream error the
+// current chunk is finished with normal ranged retries and the remaining
+// chunks fall back to the per-chunk path.
+func streamChunks(
+	ctx context.Context,
+	resp *http.Response,
+	respCancel context.CancelFunc,
+	client *http.Client,
+	holder *urlHolder,
+	headers map[string]string,
+	q *chunkQueue,
+	lane *Segment,
+	w *fileWriter,
+	progress *int64,
+	opts transferOptions,
+) error {
+	defer q.streamerDone()
+	defer resp.Body.Close()
+
+	cur := q.nextContiguous(0)
+	if cur == nil {
+		return nil
+	}
+	streamOpts := opts
+	streamOpts.Cancel = respCancel
+	for {
+		if err := copyBody(ctx, resp.Body, cur.Current(), cur, lane, w, progress, streamOpts, true); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// The open stream died mid-chunk; finish this chunk on fresh
+			// ranged connections, then hand control back to the caller's
+			// normal per-chunk loop.
+			return downloadChunkWithRetry(ctx, client, holder, headers, cur, lane, w, progress, opts)
+		}
+		next := q.nextContiguous(cur.End + 1)
+		if next == nil {
+			return nil
+		}
+		cur = next
+	}
 }
 
 func streamOpenResponse(
@@ -241,23 +507,30 @@ func copyBody(
 	if stall <= 0 {
 		stall = defaultStallTimeout
 	}
-	lastProgress := time.Now()
-	var lastProgressUnix int64 = lastProgress.UnixNano()
-	doneWatch := make(chan struct{})
+	var lastProgressUnix atomic.Int64
+	lastProgressUnix.Store(time.Now().UnixNano())
+	var stalled atomic.Bool
 	if opts.Cancel != nil {
+		// Watchdog: body.Read can block forever on a server that sends
+		// headers then goes silent; the only way to unblock it is cancelling
+		// the request context. The in-loop check below only runs after a Read
+		// returns, so it can never catch this case on its own.
+		interval := stall / 2
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond
+		}
+		doneWatch := make(chan struct{})
 		go func() {
-			ticker := time.NewTicker(stall / 2)
-			if stall/2 <= 0 {
-				ticker = time.NewTicker(stall)
-			}
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-doneWatch:
 					return
 				case <-ticker.C:
-					last := time.Unix(0, atomic.LoadInt64(&lastProgressUnix))
+					last := time.Unix(0, lastProgressUnix.Load())
 					if time.Since(last) > stall {
+						stalled.Store(true)
 						opts.Cancel()
 						return
 					}
@@ -271,24 +544,29 @@ func copyBody(
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
+			if stalled.Load() {
+				return errStalled
+			}
 			return err
 		}
-		n, readErr := body.Read(buf)
-		if n > 0 {
-			now := time.Now()
-			lastProgress = now
-			atomic.StoreInt64(&lastProgressUnix, now.UnixNano())
-			if capped {
-				if rem := chunk.Remaining(); rem >= 0 && int64(n) > rem {
-					n = int(rem)
-				}
+		// Never read past the chunk boundary: a shared streaming response
+		// continues into the next chunk, and over-reading would silently
+		// discard bytes that belong to it.
+		readBuf := buf
+		if capped {
+			if rem := chunk.Remaining(); rem >= 0 && rem < int64(len(readBuf)) {
+				readBuf = readBuf[:rem]
 			}
+		}
+		n, readErr := body.Read(readBuf)
+		if n > 0 {
+			lastProgressUnix.Store(time.Now().UnixNano())
 			if opts.Limiter != nil {
 				if err := opts.Limiter.Wait(ctx, n); err != nil {
 					return err
 				}
 			}
-			if _, werr := w.WriteAt(buf[:n], offset); werr != nil {
+			if _, werr := w.WriteAt(readBuf[:n], offset); werr != nil {
 				return werr
 			}
 			offset += int64(n)
@@ -297,9 +575,7 @@ func copyBody(
 				lane.add(int64(n))
 			}
 			atomic.AddInt64(progress, int64(n))
-			now = time.Now()
-			lastProgress = now
-			atomic.StoreInt64(&lastProgressUnix, now.UnixNano())
+			lastProgressUnix.Store(time.Now().UnixNano())
 			if capped && chunk.Complete() {
 				return nil
 			}
@@ -311,9 +587,12 @@ func copyBody(
 			return nil
 		}
 		if readErr != nil {
+			if stalled.Load() {
+				return errStalled
+			}
 			return readErr
 		}
-		if time.Since(lastProgress) > stall {
+		if time.Since(time.Unix(0, lastProgressUnix.Load())) > stall {
 			return errStalled
 		}
 	}
@@ -396,26 +675,36 @@ func buildSegments(totalSize int64, n int) []*Segment {
 func validatePartialResponse(resp *http.Response, start, end int64, id responseIdentity) error {
 	rs, re, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
 	if !ok {
-		return fmt.Errorf("missing or invalid Content-Range")
+		return fatalError{err: fmt.Errorf("missing or invalid Content-Range")}
 	}
-	if rs != start || re != end {
-		return fmt.Errorf("range mismatch: got %d-%d want %d-%d", rs, re, start, end)
+	if rs != start {
+		// Bytes would land at the wrong offset — never write these.
+		return fatalError{err: fmt.Errorf("range offset mismatch: got %d-%d want start %d", rs, re, start)}
+	}
+	// Some CDNs legally answer with a SHORTER range than requested; the retry
+	// loop keeps requesting the remainder. Only a range extending BEYOND what
+	// we asked for is rejected.
+	if re < rs || re > end {
+		return fatalError{err: fmt.Errorf("range mismatch: got %d-%d want %d-%d", rs, re, start, end)}
 	}
 	if id.TotalSize > 0 && total > 0 && total != id.TotalSize {
-		return fmt.Errorf("remote size changed: got %d want %d", total, id.TotalSize)
+		return identityChangedError{fmt.Errorf("remote size changed: got %d want %d", total, id.TotalSize)}
 	}
 	if id.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != id.ETag {
-		return fmt.Errorf("remote ETag changed")
+		return identityChangedError{fmt.Errorf("remote ETag changed")}
 	}
 	if id.LastModified != "" && resp.Header.Get("Last-Modified") != "" && resp.Header.Get("Last-Modified") != id.LastModified {
-		return fmt.Errorf("remote Last-Modified changed")
+		return identityChangedError{fmt.Errorf("remote Last-Modified changed")}
 	}
 	return nil
 }
 
+// ifRangeValue picks the validator for If-Range. RFC 9110 only allows strong
+// validators there; a weak ETag makes compliant servers ignore the condition
+// and answer 200 with the full body, which would needlessly kill the transfer.
 func ifRangeValue(id responseIdentity) string {
-	if id.ETag != "" {
-		return id.ETag
+	if et := id.ETag; et != "" && !strings.HasPrefix(et, "W/") && !strings.HasPrefix(et, "w/") {
+		return et
 	}
 	return id.LastModified
 }
@@ -432,24 +721,43 @@ func isFatalDownloadError(err error) bool {
 	return errors.As(err, &fe)
 }
 
+// identityChangedError means the remote content is no longer the file this
+// transfer started with (validator/size mismatch). The engine reacts by
+// throwing the partial data away and restarting from scratch instead of
+// surfacing a dead task.
+type identityChangedError struct {
+	err error
+}
+
+func (e identityChangedError) Error() string { return e.err.Error() }
+func (e identityChangedError) Unwrap() error { return e.err }
+
+func isIdentityChanged(err error) bool {
+	var ie identityChangedError
+	return errors.As(err, &ie)
+}
+
 func retryDelay(attempt int) time.Duration {
 	base := time.Duration(200*(1<<attempt)) * time.Millisecond
 	jitter := time.Duration(rand.Intn(120)) * time.Millisecond
-	if base > 2*time.Second {
-		base = 2 * time.Second
+	if base > 5*time.Second {
+		base = 5 * time.Second
 	}
 	return base + jitter
 }
 
 func copyBufferSize(l *speedLimiter) int {
 	if l == nil {
-		return 128 * 1024
+		return 256 * 1024
 	}
 	l.mu.Lock()
 	rate := l.rate
 	l.mu.Unlock()
 	if rate > 0 {
-		return 16 * 1024
+		if rate < 64*1024 {
+			return 16 * 1024
+		}
+		return 64 * 1024
 	}
-	return 128 * 1024
+	return 256 * 1024
 }

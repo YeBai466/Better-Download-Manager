@@ -59,6 +59,9 @@ func (s *Segment) Complete() bool { return s.loaded() >= s.size() }
 
 func (s *Segment) size() int64 { return s.End - s.Start + 1 }
 
+// reset clears the progress counter (used when a no-range stream restarts).
+func (s *Segment) reset() { atomic.StoreInt64(&s.Downloaded, 0) }
+
 func (c *Chunk) loaded() int64 { return atomic.LoadInt64(&c.Downloaded) }
 func (c *Chunk) add(n int64)   { atomic.AddInt64(&c.Downloaded, n) }
 func (c *Chunk) Current() int64 {
@@ -77,11 +80,17 @@ func (c *Chunk) Complete() bool {
 	return c.loaded() >= c.size()
 }
 func (c *Chunk) size() int64 { return c.End - c.Start + 1 }
+func (c *Chunk) reset()      { atomic.StoreInt64(&c.Downloaded, 0) }
 
 // Task is the persistent + runtime state of a single download. All access goes
 // through the mutex; use Snapshot to obtain a copy safe for serialization.
 type Task struct {
 	mu sync.RWMutex
+
+	// metaMu serializes .bdmeta sidecar writes: the persist ticker, the
+	// transfer-end flush and a pause-path flush can otherwise race on the
+	// shared temp file.
+	metaMu sync.Mutex
 
 	ID           string
 	URL          string
@@ -241,8 +250,25 @@ func (t *Task) getStatus() Status {
 	return t.Status
 }
 
-// recalcDownloaded recomputes the aggregate from segment progress.
+// casStatus transitions from->to atomically, so racing writers (a Pause vs
+// the worker launch, for example) can't silently clobber each other.
+func (t *Task) casStatus(from, to Status) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.Status != from {
+		return false
+	}
+	t.Status = to
+	t.Error = ""
+	return true
+}
+
+// recalcDownloaded recomputes the aggregate from segment progress. The slice
+// headers are read under the mutex — they are reassigned by the transfer
+// planner while Pause/reportProgress call this concurrently.
 func (t *Task) recalcDownloaded() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	var total int64
 	if len(t.Chunks) > 0 {
 		for _, c := range t.Chunks {
@@ -253,9 +279,7 @@ func (t *Task) recalcDownloaded() {
 			total += s.loaded()
 		}
 	}
-	t.mu.Lock()
 	t.Downloaded = total
-	t.mu.Unlock()
 }
 
 func (t *Task) resetTransferState() {

@@ -16,12 +16,16 @@ import (
 	"github.com/yebai/better-download-manager/internal/proxy"
 )
 
+// fixedModTime keeps Last-Modified stable across requests (see the downloader
+// package's test helper of the same name).
+var fixedModTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
 func TestServiceAddAndDownload(t *testing.T) {
 	data := make([]byte, 512*1024)
 	rand.New(rand.NewSource(7)).Read(data)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
-		http.ServeContent(w, r, "data.bin", time.Now(), newReadSeeker(data))
+		http.ServeContent(w, r, "data.bin", fixedModTime, newReadSeeker(data))
 	}))
 	defer srv.Close()
 
@@ -75,7 +79,7 @@ func TestSaveSettingsAppliesRuntimeDownloadPolicy(t *testing.T) {
 	rand.New(rand.NewSource(11)).Read(data)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
-		http.ServeContent(w, r, "data.bin", time.Now(), newReadSeeker(data))
+		http.ServeContent(w, r, "data.bin", fixedModTime, newReadSeeker(data))
 	}))
 	defer srv.Close()
 

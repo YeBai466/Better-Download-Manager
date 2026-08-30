@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/mattn/go-ieproxy"
 	xproxy "golang.org/x/net/proxy"
@@ -77,7 +78,12 @@ func applyCustom(tr *http.Transport, s Settings) error {
 		if s.Username != "" {
 			auth = &xproxy.Auth{User: s.Username, Password: s.Password}
 		}
-		dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, xproxy.Direct)
+		// Forward through a bounded net.Dialer: xproxy.Direct has no timeout,
+		// so a dead/black-holed proxy would hang the dial phase forever — the
+		// transport's ResponseHeaderTimeout only starts after the connection
+		// exists, and download requests carry no overall deadline.
+		forward := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, forward)
 		if err != nil {
 			return fmt.Errorf("socks5 dialer: %w", err)
 		}
@@ -87,7 +93,10 @@ func applyCustom(tr *http.Transport, s Settings) error {
 		}
 		tr.Proxy = nil
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return ctxDialer.DialContext(ctx, network, addr)
+			// Bound the whole dial (proxy connect + SOCKS handshake).
+			dctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			defer cancel()
+			return ctxDialer.DialContext(dctx, network, addr)
 		}
 		return nil
 	default:

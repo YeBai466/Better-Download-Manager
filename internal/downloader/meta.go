@@ -32,6 +32,11 @@ type metaFile struct {
 func metaPath(savePath string) string { return savePath + metaSuffix }
 func partPath(savePath string) string { return savePath + partSuffix }
 
+// PartPath / MetaPath expose the sidecar naming so the service layer can treat
+// a target path as occupied while its .part/.bdmeta artifacts still exist.
+func PartPath(savePath string) string { return partPath(savePath) }
+func MetaPath(savePath string) string { return metaPath(savePath) }
+
 // writeMeta persists the current segment progress next to the partial file.
 func writeMeta(t *Task) error {
 	t.mu.RLock()
@@ -62,6 +67,10 @@ func writeMeta(t *Task) error {
 	if err != nil {
 		return err
 	}
+	// Serialize the write+rename: the persist ticker, transfer-end flush and
+	// pause-path flush share one temp file per task.
+	t.metaMu.Lock()
+	defer t.metaMu.Unlock()
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err

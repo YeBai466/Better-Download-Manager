@@ -130,13 +130,38 @@ var invalidFilenameChars = strings.NewReplacer(
 	"\"", "_", "<", "_", ">", "_", "|", "_",
 )
 
-// sanitizeFilename strips path separators and characters illegal on Windows.
+// windowsReservedNames are device names Windows refuses (or worse, redirects)
+// as file base names, regardless of extension.
+var windowsReservedNames = map[string]bool{
+	"con": true, "prn": true, "aux": true, "nul": true,
+	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true,
+	"com6": true, "com7": true, "com8": true, "com9": true,
+	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true,
+	"lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true,
+}
+
+// sanitizeFilename strips path separators and characters illegal on Windows,
+// control characters, trailing dots/spaces, and reserved device names — all of
+// which a hostile Content-Disposition could otherwise smuggle in.
 func sanitizeFilename(name string) string {
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
 	name = strings.TrimSpace(name)
-	name = strings.Trim(name, ".")
+	name = strings.Trim(name, ". ")
 	name = invalidFilenameChars.Replace(name)
 	if name == "" {
 		return "download"
+	}
+	base := name
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	if windowsReservedNames[strings.ToLower(base)] {
+		name = "_" + name
 	}
 	return name
 }
@@ -196,9 +221,16 @@ func applyHeaders(req *http.Request, headers map[string]string) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	if req.Header.Get("Accept-Encoding") == "" {
-		req.Header.Set("Accept-Encoding", "identity")
-	}
+	// The engine manages ranges and validators itself. Browser-forwarded
+	// conditional headers would turn responses into 304s, and a forwarded
+	// Accept-Encoding (gzip/br) would make range offsets address the
+	// compressed representation — the saved file would be encoded garbage.
+	// Callers set their own Range/If-Range after this.
+	req.Header.Del("If-None-Match")
+	req.Header.Del("If-Modified-Since")
+	req.Header.Del("If-Range")
+	req.Header.Del("Range")
+	req.Header.Set("Accept-Encoding", "identity")
 }
 
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BetterDownloadManager/1.0"

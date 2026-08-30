@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -95,6 +96,9 @@ func NewEngine(cfg Config) *Engine {
 var ErrNotFound = errors.New("task not found")
 
 // UpdateRuntime applies settings that can change while the app is running.
+// Speed limits apply to in-flight transfers immediately (shared limiter); a
+// changed connection cap only applies to transfers started afterwards — the
+// old limiter stays with running workers so its accounting stays consistent.
 func (e *Engine) UpdateRuntime(rt RuntimeConfig) {
 	rt = normalizeRuntimeConfig(rt)
 	e.mu.Lock()
@@ -148,6 +152,10 @@ func (e *Engine) Add(opts AddOptions) (TaskInfo, error) {
 		e.mu.Unlock()
 		return TaskInfo{}, errors.New("engine closed")
 	}
+	if _, dup := e.tasks[t.ID]; dup {
+		e.mu.Unlock()
+		return TaskInfo{}, fmt.Errorf("duplicate task id %q", t.ID)
+	}
 	e.tasks[t.ID] = &managed{task: t}
 	e.order = append(e.order, t.ID)
 	e.mu.Unlock()
@@ -170,6 +178,10 @@ func (e *Engine) Restore(t *Task) {
 		t.Status = StatusPaused // we were not cleanly stopped
 	}
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
 	e.tasks[t.ID] = &managed{task: t}
 	e.order = append(e.order, t.ID)
 	e.mu.Unlock()
@@ -200,30 +212,41 @@ func (e *Engine) Start(id string) error {
 func (e *Engine) Pause(id string) error {
 	e.mu.Lock()
 	m, ok := e.tasks[id]
-	var cancel context.CancelFunc
-	if ok {
-		cancel = m.cancel
-	}
 	e.mu.Unlock()
 	if !ok {
 		return ErrNotFound
 	}
-	switch m.task.getStatus() {
-	case StatusDownloading, StatusConnecting:
-		if cancel != nil {
-			cancel()
+	for {
+		switch m.task.getStatus() {
+		case StatusDownloading, StatusConnecting:
+			// Re-read the cancel func under the engine lock: the launch that
+			// flipped the status also assigned it, possibly after our first
+			// read of m.
+			e.mu.Lock()
+			cancel := m.cancel
+			e.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			m.task.recalcDownloaded() // reflect current segment progress immediately
+			m.task.mu.Lock()
+			m.task.Speed = 0
+			m.task.mu.Unlock()
+			m.task.setStatus(StatusPaused, "")
+			e.emitManaged(m)
+			return nil
+		case StatusQueued:
+			// CAS so a concurrent launch can't overwrite the pause: if the
+			// worker won the race and already flipped Queued->Connecting, loop
+			// and take the cancel path instead.
+			if m.task.casStatus(StatusQueued, StatusPaused) {
+				e.emitManaged(m)
+				return nil
+			}
+		default:
+			return nil
 		}
-		m.task.recalcDownloaded() // reflect current segment progress immediately
-		m.task.mu.Lock()
-		m.task.Speed = 0
-		m.task.mu.Unlock()
-		m.task.setStatus(StatusPaused, "")
-		e.emitManaged(m)
-	case StatusQueued:
-		m.task.setStatus(StatusPaused, "")
-		e.emitManaged(m)
 	}
-	return nil
 }
 
 // Remove cancels (if running) and deletes a task. It returns immediately; the
@@ -293,22 +316,28 @@ func (e *Engine) Get(id string) (TaskInfo, error) {
 
 // Shutdown pauses all active tasks and prevents new ones from starting.
 func (e *Engine) Shutdown() {
+	// Snapshot cancel/done under the lock: a worker's deferred cleanup writes
+	// m.cancel concurrently (also under the lock).
+	type stopper struct {
+		cancel context.CancelFunc
+		done   chan struct{}
+	}
 	e.mu.Lock()
 	e.closed = true
-	running := make([]*managed, 0)
+	running := make([]stopper, 0)
 	for _, m := range e.tasks {
 		if m.running {
-			running = append(running, m)
+			running = append(running, stopper{cancel: m.cancel, done: m.done})
 		}
 	}
 	e.mu.Unlock()
-	for _, m := range running {
-		if m.cancel != nil {
-			m.cancel()
+	for _, s := range running {
+		if s.cancel != nil {
+			s.cancel()
 		}
 	}
-	for _, m := range running {
-		<-m.done
+	for _, s := range running {
+		<-s.done
 	}
 }
 
@@ -357,20 +386,61 @@ func (e *Engine) run(ctx context.Context, m *managed) {
 		e.schedule()
 	}()
 
+	// Queued->Connecting is a CAS: a Pause that landed between scheduling and
+	// this goroutine starting must win, not be silently clobbered.
+	if !t.casStatus(StatusQueued, StatusConnecting) {
+		return
+	}
 	client := e.cfg.ClientFactory(t.Proxy)
-	t.setStatus(StatusConnecting, "")
 	e.emitManaged(m)
 
+	// One transparent restart when the remote content changed mid-transfer
+	// (validator/size mismatch): throw the mismatched partial data away and
+	// download the new file instead of stranding the task in an error state.
+	for attempt := 0; ; attempt++ {
+		err := e.runOnce(ctx, client, t, m)
+		if err == nil {
+			removeMeta(t.SavePath)
+			t.recalcDownloaded()
+			t.setStatus(StatusCompleted, "")
+			e.emitManaged(m)
+			return
+		}
+		if isIdentityChanged(err) && ctx.Err() == nil && attempt == 0 {
+			e.resetPartial(t)
+			continue
+		}
+		e.fail(t, ctx, err)
+		return
+	}
+}
+
+// runOnce performs a single resume-or-fresh transfer attempt to completion.
+func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *managed) error {
 	// Resume path: a task we already know the layout of (paused→resumed in the
-	// same session, restored from the DB, or with a sidecar .bdmeta) skips probing
-	// and just refetches the remaining ranges. Fresh tasks take the fast-start path
-	// below, which starts streaming bytes on the very first connection.
-	resumable := e.loadResume(ctx, client, t)
+	// same session, restored from the DB, or with a sidecar .bdmeta) skips
+	// probing and just refetches the remaining ranges. Fresh tasks take the
+	// fast-start path, which starts streaming bytes on the very first
+	// connection. A network-level validation failure aborts WITHOUT resetting:
+	// a blip at resume time must not cost the user their partial data.
+	resumable, rerr := e.loadResume(ctx, client, t)
+	if rerr != nil {
+		return rerr
+	}
 
 	w, err := openPartFile(t.SavePath)
 	if err != nil {
-		e.fail(t, ctx, err)
-		return
+		return err
+	}
+	if !resumable {
+		// Fresh start over a possibly stale .part (earlier failed attempt,
+		// leftover from a deleted DB row): clear it, or a smaller new file
+		// would inherit the old tail after finalize. Shrinking is cheap —
+		// only preallocation (growing) is slow on Windows, see openPartFile.
+		if err := w.Truncate(0); err != nil {
+			w.Close()
+			return err
+		}
 	}
 
 	var xferErr error
@@ -384,60 +454,68 @@ func (e *Engine) run(ctx context.Context, m *managed) {
 	if xferErr != nil {
 		w.Close()
 		_ = writeMeta(t)
-		e.fail(t, ctx, xferErr)
-		return
+		return xferErr
 	}
-
-	if err := finalize(w, t.SavePath); err != nil {
-		e.fail(t, ctx, err)
-		return
-	}
-	removeMeta(t.SavePath)
-	t.recalcDownloaded()
-	t.setStatus(StatusCompleted, "")
-	e.emitManaged(m)
+	return finalize(w, t.SavePath)
 }
 
 // loadResume validates saved byte ranges before allowing a ranged resume.
-func (e *Engine) loadResume(ctx context.Context, client *http.Client, t *Task) bool {
+// A non-nil error means validation could not be performed (network failure) —
+// the caller must abort without touching the partial data, so the user can
+// simply retry once the connection is back.
+func (e *Engine) loadResume(ctx context.Context, client *http.Client, t *Task) (bool, error) {
 	t.mu.RLock()
 	hasChunks := len(t.Chunks) > 0
 	hasSegments := len(t.Segments) > 0
 	ranged := t.Resumable
 	t.mu.RUnlock()
 
-	if hasChunks && ranged && e.validateResume(ctx, client, t) {
-		t.recalcDownloaded()
-		return true
+	if hasChunks && ranged {
+		ok, err := e.validateResume(ctx, client, t)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			t.recalcDownloaded()
+			return true, nil
+		}
 	}
 	if hasSegments && !hasChunks && ranged {
 		e.migrateSegmentsToChunks(t)
-		if e.validateResume(ctx, client, t) {
+		ok, err := e.validateResume(ctx, client, t)
+		if err != nil {
+			return false, err
+		}
+		if ok {
 			t.recalcDownloaded()
-			return true
+			return true, nil
 		}
 	}
 
 	if m, err := readMeta(t.SavePath); err == nil && m.TotalSize > 0 {
-		if e.applyMetaIfSafe(ctx, client, t, m) {
+		ok, verr := e.applyMetaIfSafe(ctx, client, t, m)
+		if verr != nil {
+			return false, verr
+		}
+		if ok {
 			t.recalcDownloaded()
-			return true
+			return true, nil
 		}
 		e.resetPartial(t)
-		return false
+		return false, nil
 	}
 	if hasChunks || hasSegments {
 		e.resetPartial(t)
 	}
-	return false
+	return false, nil
 }
 
-func (e *Engine) applyMetaIfSafe(ctx context.Context, client *http.Client, t *Task, m *metaFile) bool {
+func (e *Engine) applyMetaIfSafe(ctx context.Context, client *http.Client, t *Task, m *metaFile) (bool, error) {
 	if m.URL != "" && m.URL != t.URL {
-		return false
+		return false, nil
 	}
 	if !m.Resumable || m.TotalSize <= 0 {
-		return false
+		return false, nil
 	}
 	t.mu.Lock()
 	t.TotalSize = m.TotalSize
@@ -470,63 +548,160 @@ func (e *Engine) applyMetaIfSafe(ctx context.Context, client *http.Client, t *Ta
 	return e.validateResume(ctx, client, t)
 }
 
-func (e *Engine) validateResume(ctx context.Context, client *http.Client, t *Task) bool {
+// validateResume re-checks the remote file before reusing partial data.
+// It returns (true, nil) to resume, (false, nil) when the content genuinely
+// no longer matches (caller restarts from scratch), and (false, err) when the
+// check could not be completed — a network blip or a transient 5xx must never
+// be mistaken for "the file changed", or the user loses their progress.
+func (e *Engine) validateResume(ctx context.Context, client *http.Client, t *Task) (bool, error) {
 	t.mu.RLock()
 	total := t.TotalSize
 	ranged := t.Resumable
 	url := t.URL
 	headers := t.headersCopy()
 	chunks := append([]*Chunk(nil), t.Chunks...)
-	identity := responseIdentity{ETag: t.ETag, LastModified: t.LastModified, FinalURL: t.FinalURL, TotalSize: t.TotalSize}
+	storedETag := t.ETag
+	storedLM := t.LastModified
 	savePath := t.SavePath
 	t.mu.RUnlock()
 	if !ranged || total <= 0 || len(chunks) == 0 {
-		return false
+		return false, nil
 	}
 	info, err := os.Stat(partPath(savePath))
 	if err != nil || info.Size() > total {
-		return false
+		return false, nil
 	}
 	if sumChunks(chunks) > info.Size() {
-		return false
+		return false, nil
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	applyHeaders(req, headers)
 	req.Header.Set("Range", "bytes=0-0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err // unreachable server: keep the partial data
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// Drain the 1-byte payload so the connection goes back to the pool
+		// for the chunk workers instead of being torn down.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+	}()
+	if isTransientStatus(resp.StatusCode) {
+		return false, fmt.Errorf("server returned %s", resp.Status)
+	}
 	if resp.StatusCode != http.StatusPartialContent {
-		return false
+		return false, nil
 	}
 	_, _, remoteTotal, ok := parseContentRange(resp.Header.Get("Content-Range"))
 	if !ok || remoteTotal != total {
-		return false
+		return false, nil
 	}
-	if identity.ETag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != identity.ETag {
-		return false
+	respETag := resp.Header.Get("ETag")
+	respLM := resp.Header.Get("Last-Modified")
+	if storedETag != "" && respETag != "" && respETag != storedETag {
+		return false, nil
 	}
-	if identity.LastModified != "" && resp.Header.Get("Last-Modified") != "" && resp.Header.Get("Last-Modified") != identity.LastModified {
-		return false
+	if storedLM != "" && respLM != "" && respLM != storedLM {
+		return false, nil
+	}
+	// Same-size content swaps are invisible on a server that exposes no
+	// validators at all — spot-check by refetching the tail of the largest
+	// downloaded chunk and comparing it with the bytes on disk.
+	if storedETag == "" && storedLM == "" && respETag == "" && respLM == "" {
+		matched, serr := sampleMatchesPart(ctx, client, url, headers, savePath, chunks)
+		if serr != nil {
+			return false, serr
+		}
+		if !matched {
+			return false, nil
+		}
 	}
 	t.mu.Lock()
 	if t.ETag == "" {
-		t.ETag = resp.Header.Get("ETag")
+		t.ETag = respETag
 	}
 	if t.LastModified == "" {
-		t.LastModified = resp.Header.Get("Last-Modified")
+		t.LastModified = respLM
 	}
-	if t.FinalURL == "" && resp.Request != nil && resp.Request.URL != nil {
+	// Always take the freshly resolved redirect target: chunk requests go
+	// there directly, and a stale signed URL from a previous session would
+	// just burn a refresh round-trip.
+	if resp.Request != nil && resp.Request.URL != nil {
 		t.FinalURL = resp.Request.URL.String()
 	}
 	t.mu.Unlock()
-	return true
+	return true, nil
+}
+
+// sampleMatchesPart refetches the tail of the most-downloaded chunk and
+// compares it byte-for-byte with the partial file. Used only when the server
+// exposes neither ETag nor Last-Modified. A non-nil error means the check was
+// inconclusive (network), which must not be read as a mismatch.
+func sampleMatchesPart(ctx context.Context, client *http.Client, url string, headers map[string]string, savePath string, chunks []*Chunk) (bool, error) {
+	var c *Chunk
+	for _, cc := range chunks {
+		if cc != nil && cc.loaded() > 0 && (c == nil || cc.loaded() > c.loaded()) {
+			c = cc
+		}
+	}
+	if c == nil {
+		return true, nil // nothing downloaded yet, nothing to mismatch
+	}
+	const sampleSize = int64(16 << 10)
+	end := c.Start + c.loaded() - 1
+	start := end - sampleSize + 1
+	if start < c.Start {
+		start = c.Start
+	}
+	local := make([]byte, end-start+1)
+	f, err := os.Open(partPath(savePath))
+	if err != nil {
+		return false, nil
+	}
+	defer f.Close()
+	if _, err := io.ReadFull(io.NewSectionReader(f, start, int64(len(local))), local); err != nil {
+		return false, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, nil
+	}
+	applyHeaders(req, headers)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
+	}
+	defer resp.Body.Close()
+	if isTransientStatus(resp.StatusCode) {
+		return false, fmt.Errorf("server returned %s", resp.Status)
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		return false, nil
+	}
+	if rs, _, _, ok := parseContentRange(resp.Header.Get("Content-Range")); !ok || rs != start {
+		return false, nil
+	}
+	remote := make([]byte, len(local))
+	if _, err := io.ReadFull(resp.Body, remote); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return false, err
+	}
+	return string(remote) == string(local), nil
 }
 
 func (e *Engine) migrateSegmentsToChunks(t *Task) {
@@ -559,41 +734,166 @@ func sumChunks(chunks []*Chunk) int64 {
 	return total
 }
 
+// openInitialResponse issues the fast-start request (Range: bytes=0-),
+// retrying transient failures — a momentary DNS hiccup or a single 503 must
+// not strand the task in an error state. It returns the open response plus the
+// cancel func of the request context (used by the stall watchdog to unblock
+// body reads).
+func (e *Engine) openInitialResponse(ctx context.Context, client *http.Client, url string, headers map[string]string, retries int) (*http.Response, context.CancelFunc, error) {
+	if retries < 1 {
+		retries = defaultRetries
+	}
+	var last error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		rctx, rcancel := context.WithCancel(ctx)
+		req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+		if err != nil {
+			rcancel()
+			return nil, nil, err
+		}
+		applyHeaders(req, headers)
+		req.Header.Set("Range", "bytes=0-")
+		resp, err := client.Do(req)
+		if err == nil {
+			switch {
+			case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent:
+				return resp, rcancel, nil
+			case isTransientStatus(resp.StatusCode):
+				last = fmt.Errorf("server returned %s", resp.Status)
+				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				rcancel()
+				if attempt < retries {
+					delay := retryDelay(attempt)
+					if retryAfter > delay {
+						delay = retryAfter
+						if delay > maxRetryAfterWait {
+							delay = maxRetryAfterWait
+						}
+					}
+					if !sleepCtx(ctx, delay) {
+						return nil, nil, ctx.Err()
+					}
+				}
+				continue
+			default:
+				status := resp.Status
+				resp.Body.Close()
+				rcancel()
+				return nil, nil, fmt.Errorf("server returned %s", status)
+			}
+		}
+		rcancel()
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		last = err
+		if attempt < retries && !sleepCtx(ctx, retryDelay(attempt)) {
+			return nil, nil, ctx.Err()
+		}
+	}
+	return nil, nil, last
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// confirmRangeSupport verifies Accept-Ranges with a real bytes=0-0 probe.
+// Servers legally answer 200 to "bytes=0-" (it means the whole file) while
+// honouring real subranges — without this probe those downloads would lose
+// both multi-connection transfer and resume.
+func confirmRangeSupport(ctx context.Context, client *http.Client, url string, headers map[string]string, total int64, etag string) bool {
+	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	applyHeaders(req, headers)
+	req.Header.Set("Range", "bytes=0-0")
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+	rs, _, n, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || rs != 0 || (n > 0 && n != total) {
+		return false
+	}
+	if etag != "" && resp.Header.Get("ETag") != "" && resp.Header.Get("ETag") != etag {
+		return false
+	}
+	return true
+}
+
 func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, w *fileWriter, m *managed) error {
 	headers := t.headersCopy()
 	url := t.URL
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// tctx cancels every sibling worker (and unblocks the streamer's body
+	// read) the moment one of them hits a fatal error, so no bandwidth is
+	// wasted downloading data the failed task would throw away.
+	tctx, tcancel := context.WithCancel(ctx)
+	defer tcancel()
+
+	retries := e.transferOptions(responseIdentity{}).Retries
+	resp, respCancel, err := e.openInitialResponse(tctx, client, url, headers, retries)
 	if err != nil {
 		return err
-	}
-	applyHeaders(req, headers)
-	req.Header.Set("Range", "bytes=0-")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode >= 400 {
-		resp.Body.Close()
-		return fmt.Errorf("server returned %s", resp.Status)
 	}
 
 	total := int64(-1)
 	ranged := false
 	if resp.StatusCode == http.StatusPartialContent {
-		if _, _, n, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && n > 0 {
+		rs, re, n, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if !ok {
+			resp.Body.Close()
+			return fmt.Errorf("missing or invalid Content-Range in %s response", resp.Status)
+		}
+		if rs != 0 {
+			// Bytes would land at the wrong offsets — refuse instead of
+			// producing a silently corrupt file.
+			resp.Body.Close()
+			return fmt.Errorf("server answered bytes=0- with range starting at %d", rs)
+		}
+		if n > 0 {
 			total = n
 			ranged = true
+		} else if re >= 0 {
+			// "bytes 0-x/*": the server honoured the open range but doesn't
+			// know the total — the range end still tells us the full size.
+			total = re + 1
+			ranged = true
 		}
-	} else if resp.StatusCode == http.StatusOK {
+	} else { // 200 OK: the server ignored the open range
 		if resp.ContentLength > 0 {
 			total = resp.ContentLength
 		}
-	} else {
-		resp.Body.Close()
-		return fmt.Errorf("unexpected status %s", resp.Status)
+		if total > 0 && strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes") {
+			probeURL := url
+			if resp.Request != nil && resp.Request.URL != nil {
+				probeURL = resp.Request.URL.String()
+			}
+			ranged = confirmRangeSupport(tctx, client, probeURL, headers, total, resp.Header.Get("ETag"))
+		}
 	}
 	if total <= 0 {
 		ranged = false
@@ -640,26 +940,30 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 	opts := e.transferOptions(identity)
 
 	if !ranged {
-		err := streamOpenResponse(ctx, resp, plan.chunks[0], plan.lanes[0], w, &progress, opts, total > 0)
+		err := e.streamNoRangeWithRetry(ctx, client, resp, respCancel, url, headers, plan.chunks[0], plan.lanes[0], w, &progress, opts, total)
 		close(stop)
 		t.recalcDownloaded()
 		_ = writeMeta(t)
 		return err
 	}
 
-	errCh := make(chan error, plan.workers)
-	q := newChunkQueue(plan.chunks)
-	first := q.nextChunk()
+	holder := newURLHolder(identity.FinalURL, url, headers)
+	q := newChunkQueue(plan.chunks, true)
+	errCh := make(chan error, plan.workers+1)
 	var wg sync.WaitGroup
 
+	// The fast-start connection already has the whole file streaming on it —
+	// keep it: worker 0 extends it through contiguous front chunks while the
+	// other workers fetch ranges from further in, meeting in the middle.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := streamOpenResponse(ctx, resp, first, plan.lanes[0], w, &progress, opts, true); err != nil {
+		if err := streamChunks(tctx, resp, respCancel, client, holder, headers, q, plan.lanes[0], w, &progress, opts); err != nil {
 			errCh <- err
+			tcancel()
 			return
 		}
-		e.consumeChunks(ctx, client, url, headers, q, plan.lanes[0], w, &progress, opts, errCh)
+		e.consumeChunks(tctx, client, holder, headers, q, plan.lanes[0], w, &progress, opts, errCh, tcancel)
 	}()
 
 	for i := 1; i < plan.workers; i++ {
@@ -667,7 +971,7 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.consumeChunks(ctx, client, url, headers, q, lane, w, &progress, opts, errCh)
+			e.consumeChunks(tctx, client, holder, headers, q, lane, w, &progress, opts, errCh, tcancel)
 		}()
 	}
 
@@ -680,12 +984,106 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for err := range errCh {
-		if err != nil {
+	return pickTransferError(ctx, errCh)
+}
+
+// streamNoRangeWithRetry downloads a file that cannot be split into ranges on
+// a single connection, restarting from scratch (the only option) on transient
+// mid-stream failures instead of stranding the task.
+func (e *Engine) streamNoRangeWithRetry(
+	ctx context.Context,
+	client *http.Client,
+	first *http.Response,
+	firstCancel context.CancelFunc,
+	url string,
+	headers map[string]string,
+	chunk *Chunk,
+	lane *Segment,
+	w *fileWriter,
+	progress *int64,
+	opts transferOptions,
+	total int64,
+) error {
+	retries := opts.Retries
+	if retries < 1 {
+		retries = defaultRetries
+	}
+	resp, cancel := first, firstCancel
+	var last error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if resp == nil {
+			rctx, rcancel := context.WithCancel(ctx)
+			req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+			if err != nil {
+				rcancel()
+				return err
+			}
+			applyHeaders(req, headers)
+			r2, err := client.Do(req)
+			if err != nil {
+				rcancel()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				last = err
+				if attempt < retries && !sleepCtx(ctx, retryDelay(attempt)) {
+					return ctx.Err()
+				}
+				continue
+			}
+			if r2.StatusCode != http.StatusOK {
+				status := r2.Status
+				transient := isTransientStatus(r2.StatusCode)
+				_, _ = io.Copy(io.Discard, io.LimitReader(r2.Body, 4096))
+				r2.Body.Close()
+				rcancel()
+				if !transient {
+					return fmt.Errorf("server returned %s", status)
+				}
+				last = fmt.Errorf("server returned %s", status)
+				if attempt < retries && !sleepCtx(ctx, retryDelay(attempt)) {
+					return ctx.Err()
+				}
+				continue
+			}
+			// The new stream starts over from byte 0; wipe the previous
+			// partial bytes so nothing stale survives underneath it.
+			if err := w.Truncate(0); err != nil {
+				r2.Body.Close()
+				rcancel()
+				return err
+			}
+			// Note: the shared progress counter is deliberately NOT reset —
+			// it only feeds the speed readout; Downloaded is recomputed from
+			// the chunk, which does restart at zero.
+			chunk.reset()
+			if lane != nil {
+				lane.reset()
+			}
+			resp, cancel = r2, rcancel
+		}
+		sopts := opts
+		sopts.Cancel = cancel
+		err := func() error {
+			defer cancel()
+			return streamOpenResponse(ctx, resp, chunk, lane, w, progress, sopts, total > 0)
+		}()
+		resp, cancel = nil, nil
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		last = err
+		if attempt < retries && !sleepCtx(ctx, retryDelay(attempt)) {
+			return ctx.Err()
+		}
 	}
-	return nil
+	return fmt.Errorf("download failed after retries: %w", last)
 }
 
 func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w *fileWriter) error {
@@ -711,7 +1109,10 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 	go e.reportProgress(t, &progress, stop)
 	go e.persistProgress(t, stop)
 
-	q := newChunkQueue(chunks)
+	tctx, tcancel := context.WithCancel(ctx)
+	defer tcancel()
+	holder := newURLHolder(identity.FinalURL, url, headers)
+	q := newChunkQueue(chunks, false)
 	workers := len(lanes)
 	errCh := make(chan error, workers)
 	opts := e.transferOptions(identity)
@@ -721,7 +1122,7 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.consumeChunks(ctx, client, url, headers, q, lane, w, &progress, opts, errCh)
+			e.consumeChunks(tctx, client, holder, headers, q, lane, w, &progress, opts, errCh, tcancel)
 		}()
 	}
 
@@ -733,18 +1134,13 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return pickTransferError(ctx, errCh)
 }
 
 func (e *Engine) consumeChunks(
 	ctx context.Context,
 	client *http.Client,
-	url string,
+	holder *urlHolder,
 	headers map[string]string,
 	q *chunkQueue,
 	lane *Segment,
@@ -752,17 +1148,52 @@ func (e *Engine) consumeChunks(
 	progress *int64,
 	opts transferOptions,
 	errCh chan<- error,
+	cancel context.CancelFunc,
 ) {
 	for {
 		c := q.nextChunk()
 		if c == nil {
 			return
 		}
-		if err := downloadChunkWithRetry(ctx, client, url, headers, c, lane, w, progress, opts); err != nil {
+		if err := downloadChunkWithRetry(ctx, client, holder, headers, c, lane, w, progress, opts); err != nil {
 			errCh <- err
+			// The task is going to fail; stop the siblings from spending time
+			// and bandwidth on data that would be thrown away.
+			if cancel != nil {
+				cancel()
+			}
 			return
 		}
 	}
+}
+
+// pickTransferError chooses the most meaningful error out of what the workers
+// reported: an identity change beats everything (it triggers the transparent
+// restart), and a real failure beats the context.Canceled noise the sibling
+// cancellation produces.
+func pickTransferError(taskCtx context.Context, errCh <-chan error) error {
+	var real, fallback error
+	for err := range errCh {
+		if err == nil {
+			continue
+		}
+		if isIdentityChanged(err) {
+			return err
+		}
+		if errors.Is(err, context.Canceled) && taskCtx.Err() == nil {
+			if fallback == nil {
+				fallback = err
+			}
+			continue
+		}
+		if real == nil {
+			real = err
+		}
+	}
+	if real != nil {
+		return real
+	}
+	return fallback
 }
 
 func (e *Engine) transferOptions(id responseIdentity) transferOptions {

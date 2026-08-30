@@ -18,6 +18,12 @@ import (
 	"github.com/yebai/better-download-manager/internal/proxy"
 )
 
+// fixedModTime keeps Last-Modified stable across requests: a per-request
+// time.Now() modtime makes ServeContent's If-Range validation report "content
+// changed" whenever requests straddle a second boundary — realistic servers
+// keep it constant for unchanged files.
+var fixedModTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
 // makeData returns deterministic pseudo-random bytes of length n.
 func makeData(n int) []byte {
 	b := make([]byte, n)
@@ -425,7 +431,7 @@ func TestResumeMetaETagMismatchRestarts(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", etag.Load().(string))
 		w.Header().Set("Accept-Ranges", "bytes")
-		http.ServeContent(w, r, "data.bin", time.Now(), newTestReadSeeker(data))
+		http.ServeContent(w, r, "data.bin", fixedModTime, newTestReadSeeker(data))
 	}))
 	defer srv.Close()
 
@@ -459,17 +465,23 @@ func TestResumeMetaETagMismatchRestarts(t *testing.T) {
 
 func TestChunkRetryCompletesAfterTransientFailure(t *testing.T) {
 	data := makeData(20 << 20)
+	// Inject the failure into a chunk well past the file front: the fast-start
+	// connection streams the leading chunks itself, so only later offsets are
+	// guaranteed to be fetched as ranged requests.
+	const failFrom = 4 << 20
 	var failed atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
-		if strings.HasPrefix(r.Header.Get("Range"), "bytes=1048576-") && failed.CompareAndSwap(false, true) {
-			w.Header().Set("Content-Length", "128")
-			w.Header().Set("Content-Range", "bytes 1048576-2097151/"+itoa(len(data)))
+		if s, e, ok := parseRange(r.Header.Get("Range"), len(data)); ok && s >= failFrom && e > s && failed.CompareAndSwap(false, true) {
+			// Promise the whole range but deliver 128 bytes, then drop the
+			// connection: the client sees an unexpected EOF mid-chunk.
+			w.Header().Set("Content-Length", itoa(e-s+1))
+			w.Header().Set("Content-Range", "bytes "+itoa(s)+"-"+itoa(e)+"/"+itoa(len(data)))
 			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write(data[1048576 : 1048576+128])
+			_, _ = w.Write(data[s : s+128])
 			return
 		}
-		http.ServeContent(w, r, "data.bin", time.Now(), newTestReadSeeker(data))
+		http.ServeContent(w, r, "data.bin", fixedModTime, newTestReadSeeker(data))
 	}))
 	defer srv.Close()
 
