@@ -199,26 +199,18 @@ func (t *Task) Snapshot() TaskInfo {
 // UI lanes (file regions) for the per-thread progress display. Each lane's
 // Downloaded is the sum of its chunks' progress, so the frontend's
 // downloaded/(end-start+1) yields a true 0..100% fill as that region completes.
+//
+// The grouping comes from chunkRegions, the same partition the transfer queue
+// assigns workers to — lane i is exactly worker i's home region, so each bar
+// shows the progress of the connection that owns it.
 func displaySegmentsFromChunks(chunks []*Chunk, n int) []Segment {
-	if n < 1 {
-		n = 1
-	}
-	if n > len(chunks) {
-		n = len(chunks)
-	}
-	if n < 1 {
+	regions := chunkRegions(len(chunks), n)
+	if len(regions) == 0 {
 		return nil
 	}
-	segs := make([]Segment, n)
-	base := len(chunks) / n
-	rem := len(chunks) % n
-	start := 0
-	for i := 0; i < n; i++ {
-		size := base
-		if i < rem {
-			size++
-		}
-		group := chunks[start : start+size]
+	segs := make([]Segment, len(regions))
+	for i, r := range regions {
+		group := chunks[r[0]:r[1]]
 		var downloaded int64
 		for _, c := range group {
 			downloaded += c.loaded()
@@ -229,7 +221,6 @@ func displaySegmentsFromChunks(chunks []*Chunk, n int) []Segment {
 			End:        group[len(group)-1].End,
 			Downloaded: downloaded,
 		}
-		start += size
 	}
 	return segs
 }

@@ -987,13 +987,15 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 	}
 
 	holder := newURLHolder(identity.FinalURL, url, headers)
-	q := newChunkQueue(plan.chunks, true)
+	q := newChunkQueue(plan.chunks, plan.workers, true)
 	errCh := make(chan error, plan.workers+1)
 	var wg sync.WaitGroup
 
 	// The fast-start connection already has the whole file streaming on it —
-	// keep it: worker 0 extends it through contiguous front chunks while the
-	// other workers fetch ranges from further in, meeting in the middle.
+	// keep it: worker 0 extends it through the contiguous chunks of its own
+	// region, then joins the others in the steal pool. The remaining workers
+	// each open a ranged connection at the head of their own region, so all
+	// connections are live and spread across the file from the first second.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1002,15 +1004,15 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 			tcancel()
 			return
 		}
-		e.consumeChunks(tctx, client, holder, headers, q, plan.lanes[0], w, &progress, opts, errCh, tcancel)
+		e.consumeChunks(tctx, client, holder, headers, q, 0, plan.lanes[0], w, &progress, opts, errCh, tcancel)
 	}()
 
 	for i := 1; i < plan.workers; i++ {
-		lane := plan.lanes[i]
+		worker, lane := i, plan.lanes[i]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.consumeChunks(tctx, client, holder, headers, q, lane, w, &progress, opts, errCh, tcancel)
+			e.consumeChunks(tctx, client, holder, headers, q, worker, lane, w, &progress, opts, errCh, tcancel)
 		}()
 	}
 
@@ -1151,17 +1153,17 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 	tctx, tcancel := context.WithCancel(ctx)
 	defer tcancel()
 	holder := newURLHolder(identity.FinalURL, url, headers)
-	q := newChunkQueue(chunks, false)
 	workers := len(lanes)
+	q := newChunkQueue(chunks, workers, false)
 	errCh := make(chan error, workers)
 	opts := e.transferOptions(identity)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		lane := lanes[i]
+		worker, lane := i, lanes[i]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			e.consumeChunks(tctx, client, holder, headers, q, lane, w, &progress, opts, errCh, tcancel)
+			e.consumeChunks(tctx, client, holder, headers, q, worker, lane, w, &progress, opts, errCh, tcancel)
 		}()
 	}
 
@@ -1182,6 +1184,7 @@ func (e *Engine) consumeChunks(
 	holder *urlHolder,
 	headers map[string]string,
 	q *chunkQueue,
+	worker int,
 	lane *Segment,
 	w *fileWriter,
 	progress *int64,
@@ -1190,7 +1193,7 @@ func (e *Engine) consumeChunks(
 	cancel context.CancelFunc,
 ) {
 	for {
-		c := q.nextChunk()
+		c := q.nextChunk(worker)
 		if c == nil {
 			return
 		}

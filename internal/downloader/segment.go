@@ -161,6 +161,38 @@ func resolveFreshURL(ctx context.Context, client *http.Client, origin string, he
 	return origin, nil
 }
 
+// chunkRegions partitions n chunk indices into workers contiguous regions,
+// returned as [start, end) index bounds.
+//
+// The transfer queue and the per-thread UI display MUST derive their grouping
+// from this one function: region i is both worker i's starting territory and
+// the file span drawn as "thread i+1". Computing them separately would let the
+// two drift apart and the thread bars would stop matching what the connections
+// are actually doing.
+func chunkRegions(n, workers int) [][2]int {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		return nil // no chunks
+	}
+	regions := make([][2]int, workers)
+	base, rem := n/workers, n%workers
+	start := 0
+	for i := 0; i < workers; i++ {
+		size := base
+		if i < rem {
+			size++
+		}
+		regions[i] = [2]int{start, start + size}
+		start += size
+	}
+	return regions
+}
+
 // chunkQueue hands chunks to workers. While holdLowest is set, the lowest
 // unclaimed chunk is reserved for the fast-start streamer, which extends its
 // already-open whole-file response through contiguous chunks instead of paying
@@ -170,18 +202,50 @@ type chunkQueue struct {
 	chunks     []*Chunk
 	claimed    []bool
 	holdLowest bool
+	// regions[i] is worker i's home territory. Workers start spread across the
+	// file instead of all claiming from the front, so every connection — and
+	// every thread bar in the UI — is live from the first second.
+	regions [][2]int
 }
 
-func newChunkQueue(chunks []*Chunk, holdLowest bool) *chunkQueue {
-	return &chunkQueue{chunks: chunks, claimed: make([]bool, len(chunks)), holdLowest: holdLowest}
+func newChunkQueue(chunks []*Chunk, workers int, holdLowest bool) *chunkQueue {
+	return &chunkQueue{
+		chunks:     chunks,
+		claimed:    make([]bool, len(chunks)),
+		holdLowest: holdLowest,
+		regions:    chunkRegions(len(chunks), workers),
+	}
 }
 
-// nextChunk hands out the next unclaimed incomplete chunk for a ranged worker,
-// skipping the streamer's reserved (lowest) chunk unless it is the only work
-// left — a worker should steal it rather than idle while the streamer crawls.
-func (q *chunkQueue) nextChunk() *Chunk {
+// nextChunk hands worker its next chunk: first the lowest unfinished chunk in
+// its own region, and once that region is drained, whatever is left anywhere
+// (work stealing). Draining the home region first is what keeps the connections
+// spread over distinct parts of the file; stealing afterwards is what stops a
+// worker idling while a slow sibling still has a backlog, and keeps the endgame
+// tail bounded.
+func (q *chunkQueue) nextChunk(worker int) *Chunk {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if worker >= 0 && worker < len(q.regions) {
+		// No holdLowest guard needed here: only region 0 contains the reserved
+		// chunk, and its owner is the streamer itself, which reaches this path
+		// only after streaming ended (and cleared holdLowest).
+		lo, hi := q.regions[worker][0], q.regions[worker][1]
+		for i := lo; i < hi; i++ {
+			if q.claimed[i] || q.chunks[i].Complete() {
+				continue
+			}
+			q.claimed[i] = true
+			return q.chunks[i]
+		}
+	}
+	return q.stealLocked()
+}
+
+// stealLocked returns the lowest unclaimed incomplete chunk anywhere, skipping
+// the streamer's reserved chunk unless it is the only work left — a worker
+// should steal it rather than idle while the streamer crawls.
+func (q *chunkQueue) stealLocked() *Chunk {
 	first := -1
 	for i, c := range q.chunks {
 		if q.claimed[i] || c.Complete() {

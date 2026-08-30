@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -753,5 +754,210 @@ func TestTransferPlanTapersTail(t *testing.T) {
 		if c.size() != solo.chunks[0].size() {
 			t.Fatalf("single-worker plan should stay uniform, chunk %d differs", i)
 		}
+	}
+}
+
+// TestWorkersStartSpreadAcrossFile: the dynamic queue used to hand every worker
+// a chunk off the front of the file, so all N connections crowded into the first
+// UI lane and the per-thread bars lit up one after another (looking like the
+// threads started serially, even though they were all running). Each worker must
+// start in its OWN region.
+func TestWorkersStartSpreadAcrossFile(t *testing.T) {
+	for _, total := range []int64{30 << 20, 100 << 20, 1 << 30, 4 << 30} {
+		plan := buildTransferPlan(total, 8)
+		lanes := displaySegmentsFromChunks(plan.chunks, plan.workers)
+		if len(lanes) != plan.workers {
+			t.Fatalf("total=%d: %d UI lanes for %d workers", total, len(lanes), plan.workers)
+		}
+
+		// Fast-start layout: worker 0 is the streamer and takes the reserved
+		// lowest chunk; the rest claim ranged chunks concurrently.
+		q := newChunkQueue(plan.chunks, plan.workers, true)
+		claims := make([]*Chunk, plan.workers)
+		claims[0] = q.nextContiguous(0)
+		for i := 1; i < plan.workers; i++ {
+			claims[i] = q.nextChunk(i)
+		}
+		for i, c := range claims {
+			if c == nil {
+				t.Fatalf("total=%d: worker %d got no chunk at start", total, i)
+			}
+			if c.Start < lanes[i].Start || c.End > lanes[i].End {
+				t.Fatalf("total=%d: worker %d started on chunk %d-%d, outside its lane %d-%d",
+					total, i, c.Start, c.End, lanes[i].Start, lanes[i].End)
+			}
+		}
+
+		// Resume layout (no streamer): same requirement.
+		q = newChunkQueue(plan.chunks, plan.workers, false)
+		for i := 0; i < plan.workers; i++ {
+			c := q.nextChunk(i)
+			if c == nil {
+				t.Fatalf("total=%d: resume worker %d got no chunk at start", total, i)
+			}
+			if c.Start < lanes[i].Start || c.End > lanes[i].End {
+				t.Fatalf("total=%d: resume worker %d started on chunk %d-%d, outside its lane %d-%d",
+					total, i, c.Start, c.End, lanes[i].Start, lanes[i].End)
+			}
+		}
+	}
+}
+
+// TestQueueDrainsExactlyOnceWithStealing: spreading workers must not cost the
+// work stealing that keeps a fast worker busy (and bounds the endgame tail).
+// Every chunk must still be handed out exactly once, to somebody.
+func TestQueueDrainsExactlyOnceWithStealing(t *testing.T) {
+	plan := buildTransferPlan(1<<30, 8)
+	q := newChunkQueue(plan.chunks, plan.workers, false)
+
+	seen := make(map[int]int, len(plan.chunks))
+	// Worker 0 races ahead: it drains its own region, then must steal.
+	stolen := 0
+	regions := chunkRegions(len(plan.chunks), plan.workers)
+	for {
+		c := q.nextChunk(0)
+		if c == nil {
+			break
+		}
+		seen[c.Index]++
+		if c.Index < regions[0][0] || c.Index >= regions[0][1] {
+			stolen++
+		}
+	}
+	if stolen == 0 {
+		t.Fatal("worker 0 never stole work after draining its own region")
+	}
+	// Everyone else finds the queue already empty.
+	for i := 1; i < plan.workers; i++ {
+		if c := q.nextChunk(i); c != nil {
+			t.Fatalf("worker %d got chunk %d from a drained queue", i, c.Index)
+		}
+	}
+	if len(seen) != len(plan.chunks) {
+		t.Fatalf("handed out %d of %d chunks", len(seen), len(plan.chunks))
+	}
+	for idx, n := range seen {
+		if n != 1 {
+			t.Fatalf("chunk %d handed out %d times", idx, n)
+		}
+	}
+}
+
+// TestStreamerChunkStaysReserved: while the fast-start stream is alive, ranged
+// workers must not claim the chunk it is streaming into — unless it is the only
+// work left, in which case idling would be worse.
+func TestStreamerChunkStaysReserved(t *testing.T) {
+	plan := buildTransferPlan(1<<30, 8)
+	q := newChunkQueue(plan.chunks, plan.workers, true)
+	for i := 1; i < plan.workers; i++ {
+		if c := q.nextChunk(i); c == nil || c.Index == 0 {
+			t.Fatalf("worker %d claimed the streamer's reserved chunk", i)
+		}
+	}
+	if c := q.nextContiguous(0); c == nil || c.Index != 0 {
+		t.Fatal("streamer lost its reserved chunk")
+	}
+
+	// Last chunk standing: a waiting worker must take it rather than idle.
+	solo := []*Chunk{{Index: 0, Start: 0, End: 1023}}
+	q = newChunkQueue(solo, 4, true)
+	if c := q.nextChunk(1); c == nil || c.Index != 0 {
+		t.Fatal("worker idled instead of stealing the only remaining chunk")
+	}
+}
+
+// TestConnectionsFanOutAcrossFile is the end-to-end counterpart of
+// TestWorkersStartSpreadAcrossFile: it checks the wire, not just the queue.
+// The initial burst of ranged requests must reach across the whole file rather
+// than clustering at its front.
+func TestConnectionsFanOutAcrossFile(t *testing.T) {
+	const total = 64 << 20 // 64 MiB -> 8 workers, 8 MiB chunks
+	data := makeData(total)
+
+	var mu sync.Mutex
+	var starts []int
+	gotBurst := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end := 0, len(data)-1
+		ranged := false
+		w.Header().Set("Accept-Ranges", "bytes")
+		if s, e, ok := parseRange(r.Header.Get("Range"), len(data)); ok {
+			start, end, ranged = s, e, true
+		}
+		if ranged && end > start { // ignore the 1-byte probes
+			mu.Lock()
+			starts = append(starts, start)
+			if len(starts) == 8 {
+				close(gotBurst)
+			}
+			mu.Unlock()
+		}
+		body := data[start : end+1]
+		w.Header().Set("Content-Length", itoa(len(body)))
+		if ranged {
+			w.Header().Set("Content-Range", "bytes "+itoa(start)+"-"+itoa(end)+"/"+itoa(len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		// Trickle, so every worker issues its first request before any of them
+		// finishes a chunk and asks for a second one.
+		flusher, _ := w.(http.Flusher)
+		for off := 0; off < len(body); off += 4096 {
+			ce := off + 4096
+			if ce > len(body) {
+				ce = len(body)
+			}
+			if _, err := w.Write(body[off:ce]); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	updates := make(chan TaskInfo, 256)
+	e := newTestEngine(updates)
+	defer e.Shutdown()
+
+	dst := filepath.Join(t.TempDir(), "fanout.bin")
+	if _, err := e.Add(AddOptions{
+		ID: "t1", URL: srv.URL, SavePath: dst, Connections: 8, AutoStart: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gotBurst:
+	case <-time.After(30 * time.Second):
+		mu.Lock()
+		n := len(starts)
+		mu.Unlock()
+		t.Fatalf("only %d ranged requests in 30s, expected 8 connections to fan out", n)
+	}
+	_ = e.Pause("t1")
+
+	mu.Lock()
+	burst := append([]int(nil), starts[:8]...)
+	mu.Unlock()
+
+	// Every opening request must land in a DIFFERENT UI lane. When the workers
+	// all claim off the front of the file instead, the burst piles into the
+	// first few lanes and the rest of the thread bars stay dark until the
+	// workers get there.
+	plan := buildTransferPlan(total, 8)
+	lanes := displaySegmentsFromChunks(plan.chunks, plan.workers)
+	hit := map[int]int{}
+	for _, s := range burst {
+		for li, l := range lanes {
+			if int64(s) >= l.Start && int64(s) <= l.End {
+				hit[li]++
+				break
+			}
+		}
+	}
+	if len(hit) != len(lanes) {
+		t.Fatalf("opening requests covered %d of %d lanes (offsets %v, per-lane hits %v)",
+			len(hit), len(lanes), burst, hit)
 	}
 }
