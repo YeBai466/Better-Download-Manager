@@ -86,16 +86,17 @@ func Install(id, updateURL string, browsers []string) error {
 
 // Uninstall removes the force-install entry for the given browsers (empty = all).
 func Uninstall(id string, browsers []string) error {
+	return runElevated(uninstallScript(id, browsers))
+}
+func uninstallScript(id string, browsers []string) string {
 	var b strings.Builder
 	for name, key := range forcelistKeys {
 		if !wantBrowser(browsers, name) {
 			continue
 		}
-		// Remove both the id-named value and the legacy "1" slot, if present.
-		fmt.Fprintf(&b, "Remove-ItemProperty -Path 'HKLM:\\%s' -Name '%s' -ErrorAction SilentlyContinue\n", key, id)
-		fmt.Fprintf(&b, "Remove-ItemProperty -Path 'HKLM:\\%s' -Name '1' -ErrorAction SilentlyContinue\n", key)
+		fmt.Fprintf(&b, "$key=Get-Item -LiteralPath 'HKLM:\\%s' -ErrorAction SilentlyContinue\nif ($key) { foreach ($name in $key.GetValueNames()) { if ([string]$key.GetValue($name) -like '%s;*') { Remove-ItemProperty -LiteralPath 'HKLM:\\%s' -Name $name -ErrorAction Stop } } }\n", key, id, key)
 	}
-	return runElevated(b.String())
+	return b.String()
 }
 
 func wantBrowser(browsers []string, name string) bool {
@@ -119,15 +120,15 @@ func runElevated(script string) error {
 	}
 	path := tmp.Name()
 	defer os.Remove(path)
-	if _, err := tmp.WriteString(script); err != nil {
+	if _, err := tmp.WriteString("$ErrorActionPreference='Stop'\ntry {\n" + script + "\n} catch { Write-Error $_; exit 1 }\nexit 0\n"); err != nil {
 		tmp.Close()
 		return err
 	}
 	tmp.Close()
 
 	psCmd := fmt.Sprintf(
-		"Start-Process -FilePath powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','%s'",
-		filepath.Clean(path),
+		"$p=Start-Process -FilePath powershell -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','%s'; exit $p.ExitCode",
+		strings.ReplaceAll(filepath.Clean(path), "'", "''"),
 	)
 	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
 	out, err := cmd.CombinedOutput()

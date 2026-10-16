@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,6 +40,65 @@ func TestUnknownContentRangeRequiresFullResponse(t *testing.T) {
 		t.Fatal(info.Error)
 	}
 	assertFileEquals(t, dst, data)
+}
+
+func TestEmptyDownloadReportsCompleteProgress(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Length", "0") }))
+	defer srv.Close()
+	updates := make(chan TaskInfo, 128)
+	e := newTestEngine(updates)
+	defer e.Shutdown()
+	dst := filepath.Join(t.TempDir(), "empty.bin")
+	_, err := e.Add(AddOptions{ID: "empty", URL: srv.URL, SavePath: dst, AutoStart: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := waitForStatus(t, updates, StatusCompleted, StatusError)
+	if info.Status != StatusCompleted || info.Progress != 1 || info.TotalSize != 0 || info.Speed != 0 {
+		t.Fatalf("incorrect empty-file state: %+v", info)
+	}
+	assertFileEquals(t, dst, nil)
+}
+
+func TestPauseLatencyP95(t *testing.T) {
+	started := make(chan struct{}, 32)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1048576")
+		_, _ = w.Write(make([]byte, 64<<10))
+		w.(http.Flusher).Flush()
+		started <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	e := NewEngine(Config{MaxConcurrent: 1})
+	defer e.Shutdown()
+	dir := t.TempDir()
+	samples := make([]time.Duration, 20)
+	for i := range samples {
+		id := fmt.Sprint(i)
+		if _, err := e.Add(AddOptions{ID: id, URL: srv.URL, SavePath: filepath.Join(dir, id), AutoStart: true}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("request did not start")
+		}
+		start := time.Now()
+		if err := e.Pause(id); err != nil {
+			t.Fatal(err)
+		}
+		samples[i] = time.Since(start)
+		if err := e.Remove(id, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	p95 := samples[18]
+	t.Logf("20 active HTTP transfers: pause P95=%s", p95)
+	if p95 >= 250*time.Millisecond {
+		t.Fatalf("pause P95 exceeds target: %s", p95)
+	}
 }
 
 func TestRecoverRenameBeforeDatabaseCommit(t *testing.T) {
@@ -112,6 +172,49 @@ func TestFailedAdmissionDoesNotRegisterTask(t *testing.T) {
 	}
 	if len(e.List()) != 0 {
 		t.Fatal("failed task was registered")
+	}
+}
+
+func TestPauseDoesNotWaitForPersistence(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	e := NewEngine(Config{Persist: func(r Record) error {
+		if r.Status == StatusConnecting {
+			close(entered)
+			<-release
+		}
+		return nil
+	}})
+	defer e.Shutdown()
+	_, err := e.Add(AddOptions{ID: "pause", URL: "https://example.invalid/file", SavePath: filepath.Join(t.TempDir(), "file"), AutoStart: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	start := time.Now()
+	if err := e.Pause("pause"); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	close(release)
+	if elapsed >= 250*time.Millisecond {
+		t.Fatalf("pause blocked on storage: %s", elapsed)
+	}
+}
+
+func TestSplitRangesAreNotImmediatelyRecombined(t *testing.T) {
+	chunk := &Chunk{Index: 0, Start: 0, End: 8<<20 - 1, Downloaded: 1 << 20}
+	task := &Task{Chunks: []*Chunk{chunk}}
+	q := newChunkQueue(task.Chunks, 1, false)
+	q.claimed[0] = true
+	q.setActive(0, []*Chunk{chunk})
+	q.requeueAndSplit(0, task, true)
+	if !validChunkLayout(task.Chunks, 8<<20, 1<<20) {
+		t.Fatal("split introduced a gap or overlap")
+	}
+	batch := q.takeBatch(0, 32<<20)
+	if len(batch) != 1 || !batch[0].split {
+		t.Fatalf("split tail was merged again: %+v", batch)
 	}
 }
 
@@ -245,6 +348,34 @@ func TestLowLimitIsNotNetworkStall(t *testing.T) {
 		t.Fatal(info.Error)
 	}
 	assertFileEquals(t, dst, data)
+}
+
+func TestGlobalSpeedLimitAccuracy(t *testing.T) {
+	data := makeData(512 << 10)
+	srv := rangeServer(t, data, false, 0)
+	defer srv.Close()
+	updates := make(chan TaskInfo, 256)
+	e := newTestEngineCfg(updates, func(c *Config) { c.MaxConcurrent = 2; c.SpeedLimit = 256 << 10 })
+	defer e.Shutdown()
+	dir := t.TempDir()
+	start := time.Now()
+	for i := 0; i < 2; i++ {
+		id := fmt.Sprint(i)
+		if _, err := e.Add(AddOptions{ID: id, URL: srv.URL, SavePath: filepath.Join(dir, id), AutoStart: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if info := waitForStatus(t, updates, StatusCompleted, StatusError); info.Status != StatusCompleted {
+			t.Fatal(info.Error)
+		}
+	}
+	rate := float64(2*len(data)) / time.Since(start).Seconds()
+	ratio := rate / float64(256<<10)
+	t.Logf("global rate=%.2f KiB/s, target=256 KiB/s, ratio=%.4f", rate/1024, ratio)
+	if ratio < 0.90 || ratio > 1.10 {
+		t.Fatalf("global speed limit outside 10%% tolerance: %.4f", ratio)
+	}
 }
 
 func TestSpeedLimitChangeWakesWaiter(t *testing.T) {

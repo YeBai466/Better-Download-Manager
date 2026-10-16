@@ -12,6 +12,7 @@ type activeWorker struct {
 	cancel  context.CancelFunc
 	started time.Time
 	yield   bool
+	split   bool
 }
 type workerResult struct {
 	index int
@@ -96,7 +97,7 @@ func (e *Engine) runWorkers(ctx context.Context, client *http.Client, holder *ur
 			worker := workers[result.index]
 			delete(workers, result.index)
 			if worker.yield {
-				q.requeueAndSplit(result.index, t)
+				q.requeueAndSplit(result.index, t, worker.split)
 			} else {
 				q.clearActive(result.index)
 				if result.err != nil && failure == nil && ctx.Err() == nil {
@@ -124,12 +125,12 @@ func (e *Engine) runWorkers(ctx context.Context, client *http.Client, holder *ur
 					probeWindows--
 					if probeWindows == 0 {
 						if rate < baseline*1.10 {
-							target = max(initial, target-1)
+							target = max(1, target-1)
 							ceiling = target
 						}
 						baseline = 0
 					}
-				} else if q.pending() && target < ceiling && rate > 0 {
+				} else if (q.pending() || q.splittable()) && target < ceiling && rate > 0 {
 					baseline = rate
 					target++
 					probeWindows = 2
@@ -149,8 +150,9 @@ func (e *Engine) runWorkers(ctx context.Context, client *http.Client, holder *ur
 			}
 			if ctx.Err() == nil && !q.pending() && len(workers) < target {
 				for i, worker := range workers {
-					if !worker.yield && now.Sub(worker.started) > 2*time.Second && q.remaining(i) >= 2<<20 {
+					if !worker.yield && now.Sub(worker.started) > 2*time.Second && q.tailCandidate(i) {
 						worker.yield = true
+						worker.split = true
 						worker.cancel()
 						break
 					}
@@ -190,13 +192,33 @@ func (q *chunkQueue) pending() bool {
 	}
 	return false
 }
+
+func (q *chunkQueue) splittable() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, batch := range q.active {
+		for _, chunk := range batch {
+			if chunk.Remaining() >= 2<<20 {
+				return true
+			}
+		}
+	}
+	return false
+}
 func (q *chunkQueue) setActive(worker int, chunks []*Chunk) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.active == nil {
 		q.active = map[int][]*Chunk{}
+		q.activeSince = map[int]time.Time{}
+		q.activeRemaining = map[int]int64{}
 	}
 	q.active[worker] = chunks
+	q.activeSince[worker] = time.Now()
+	q.activeRemaining[worker] = 0
+	for _, c := range chunks {
+		q.activeRemaining[worker] += c.Remaining()
+	}
 }
 func (q *chunkQueue) clearActive(worker int) { q.mu.Lock(); delete(q.active, worker); q.mu.Unlock() }
 func (q *chunkQueue) remaining(worker int) int64 {
@@ -215,6 +237,9 @@ func (q *chunkQueue) takeBatch(worker int, limit int64) []*Chunk {
 		return nil
 	}
 	batch := []*Chunk{first}
+	if first.split {
+		return batch
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	index := -1
@@ -234,7 +259,7 @@ func (q *chunkQueue) takeBatch(worker int, limit int64) []*Chunk {
 	bytes := first.Remaining()
 	for i := index + 1; i < end; i++ {
 		c := q.chunks[i]
-		if q.claimed[i] || c.loaded() != 0 || c.Start != batch[len(batch)-1].End+1 || bytes+c.size() > limit {
+		if c.split || q.claimed[i] || c.loaded() != 0 || c.Start != batch[len(batch)-1].End+1 || bytes+c.size() > limit {
 			break
 		}
 		q.claimed[i] = true
@@ -244,14 +269,14 @@ func (q *chunkQueue) takeBatch(worker int, limit int64) []*Chunk {
 	return batch
 }
 
-func (q *chunkQueue) requeueAndSplit(worker int, t *Task) {
+func (q *chunkQueue) requeueAndSplit(worker int, t *Task, splitTail bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	batch := q.active[worker]
 	delete(q.active, worker)
 	var split *Chunk
 	for _, c := range batch {
-		if c.Remaining() >= 2<<20 && (split == nil || c.Remaining() > split.Remaining()) {
+		if splitTail && c.Remaining() >= 2<<20 && (split == nil || c.Remaining() > split.Remaining()) {
 			split = c
 		}
 	}
@@ -280,7 +305,7 @@ func (q *chunkQueue) requeueAndSplit(worker int, t *Task) {
 			claimed = append(claimed, true)
 		}
 		mid := start + (c.End-start+1)/2
-		chunks = append(chunks, &Chunk{Index: maxIndex + 1, Start: start, End: mid - 1}, &Chunk{Index: maxIndex + 2, Start: mid, End: c.End})
+		chunks = append(chunks, &Chunk{split: true, Index: maxIndex + 1, Start: start, End: mid - 1}, &Chunk{split: true, Index: maxIndex + 2, Start: mid, End: c.End})
 		claimed = append(claimed, false, false)
 	}
 	q.chunks, q.claimed = chunks, claimed
@@ -346,3 +371,24 @@ func (g *readGuard) End() bool {
 	return g.stalled.Load()
 }
 func (g *readGuard) Close() { close(g.done) }
+
+func (q *chunkQueue) tailCandidate(worker int) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var remaining int64
+	for _, c := range q.active[worker] {
+		remaining += c.Remaining()
+	}
+	if remaining < 2<<20 {
+		return false
+	}
+	elapsed := time.Since(q.activeSince[worker]).Seconds()
+	if elapsed < 1 {
+		return false
+	}
+	transferred := q.activeRemaining[worker] - remaining
+	if transferred <= 0 {
+		return elapsed > 2
+	}
+	return float64(remaining)*elapsed/float64(transferred) > 2
+}

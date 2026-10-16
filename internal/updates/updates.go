@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -18,13 +19,13 @@ const Repo = "YeBai466/Better-Download-Manager"
 
 // Result describes the outcome of an update check.
 type Result struct {
-	Current      string `json:"current"`      // running version
-	Latest       string `json:"latest"`       // latest release tag (normalized, no leading v)
-	HasUpdate    bool   `json:"hasUpdate"`    // Latest > Current
-	Notes        string `json:"notes"`        // release body (markdown)
-	ReleaseURL   string `json:"releaseUrl"`   // html_url of the release page
-	DownloadURL  string `json:"downloadUrl"`  // installer asset URL (.exe), if found
-	PublishedAt  string `json:"publishedAt"`
+	Current     string `json:"current"`     // running version
+	Latest      string `json:"latest"`      // latest release tag (normalized, no leading v)
+	HasUpdate   bool   `json:"hasUpdate"`   // Latest > Current
+	Notes       string `json:"notes"`       // release body (markdown)
+	ReleaseURL  string `json:"releaseUrl"`  // html_url of the release page
+	DownloadURL string `json:"downloadUrl"` // installer asset URL (.exe), if found
+	PublishedAt string `json:"publishedAt"`
 }
 
 type ghRelease struct {
@@ -43,6 +44,10 @@ type ghRelease struct {
 
 // Check queries the latest GitHub release and compares it to current.
 func Check(ctx context.Context, current string) (Result, error) {
+	return CheckWithClient(ctx, current, &http.Client{Timeout: 15 * time.Second})
+}
+
+func CheckWithClient(ctx context.Context, current string, client *http.Client) (Result, error) {
 	res := Result{Current: normalize(current)}
 
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", Repo)
@@ -53,7 +58,6 @@ func Check(ctx context.Context, current string) (Result, error) {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "BetterDownloadManager-UpdateCheck")
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return res, err
@@ -76,7 +80,7 @@ func Check(ctx context.Context, current string) (Result, error) {
 	res.ReleaseURL = rel.HTMLURL
 	res.PublishedAt = rel.PublishedAt
 	for _, a := range rel.Assets {
-		if strings.HasSuffix(strings.ToLower(a.Name), ".exe") {
+		if name := strings.ToLower(a.Name); strings.HasSuffix(name, "-"+runtime.GOARCH+"-installer.exe") {
 			res.DownloadURL = a.BrowserDownloadURL
 			break
 		}

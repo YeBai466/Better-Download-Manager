@@ -1,13 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import "./styles.css";
-import {
-  api,
-  onEvent,
-  EVT_TASK_UPDATE,
-  EVT_TASK_REMOVED,
-  type TaskInfo,
-  type Settings,
-} from "./api";
+import { useTaskFeed } from "./useTaskFeed";
+import { api, onEvent, type Settings } from "./api";
 import MenuBar from "./components/MenuBar";
 import Toolbar from "./components/Toolbar";
 import Sidebar, { type Filter } from "./components/Sidebar";
@@ -23,7 +17,8 @@ const APP_VERSION = "1.2.1";
 
 export default function App() {
   useLang(); // re-render the whole tree when the language changes
-  const [tasks, setTasks] = useState<Map<string, TaskInfo>>(new Map());
+  const { tasks, reload } = useTaskFeed();
+  const [error, setError] = useState("");
   const [categories, setCategories] = useState<string[]>([]);
   const [filter, setFilter] = useState<Filter>({ kind: "all" });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -34,54 +29,53 @@ export default function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
 
-  const upsert = useCallback((t: TaskInfo) => {
-    setTasks((prev) => new Map(prev).set(t.id, t));
-  }, []);
-
-  const reload = useCallback(async () => {
-    const list = await api.listTasks();
-    const m = new Map<string, TaskInfo>();
-    for (const t of list ?? []) m.set(t.id, t);
-    setTasks(m);
-  }, []);
-
   useEffect(() => {
-    reload();
     api.categories().then((c) => setCategories(c ?? []));
     api.getSettings().then(async (cfg) => {
       setLang(cfg.language);
       setSettings(cfg);
       // On startup, offer the one-time manual extension install (unless ignored).
       if (cfg.takeoverEnabled && !cfg.extPromptIgnored) {
-        const configured = await api.browserExtensionConfigured().catch(() => false);
+        const configured = await api
+          .browserExtensionConfigured()
+          .catch(() => false);
         if (!configured) setExtPrompt(true);
       }
       // Auto-check for updates (silent unless a newer version exists).
       if (cfg.autoCheckUpdate) {
-        api.checkForUpdates()
-          .then((r) => { if (r.hasUpdate) setUpdate(r as UpdateInfo); })
+        api
+          .checkForUpdates()
+          .then((r) => {
+            if (r.hasUpdate) setUpdate(r as UpdateInfo);
+          })
           .catch(() => {});
       }
     });
 
     // Manual "立即检查更新" in Options dispatches this when an update is found.
-    const onUpd = (e: Event) => setUpdate((e as CustomEvent).detail as UpdateInfo);
+    const onUpd = (e: Event) =>
+      setUpdate((e as CustomEvent).detail as UpdateInfo);
     window.addEventListener("bdm:update", onUpd);
 
-    const offUpdate = onEvent<TaskInfo>(EVT_TASK_UPDATE, upsert);
-    const offRemoved = onEvent<string>(EVT_TASK_REMOVED, (id) =>
-      setTasks((prev) => {
-        const next = new Map(prev);
-        next.delete(id);
-        return next;
-      })
-    );
-    return () => {
-      offUpdate();
-      offRemoved();
-      window.removeEventListener("bdm:update", onUpd);
+    const offSettings = onEvent<Settings>("settings:changed", (cfg) => {
+      setSettings(cfg);
+      setLang(cfg.language);
+    });
+    const onError = (event: Event) =>
+      setError(String((event as CustomEvent).detail));
+    const onRejected = (event: PromiseRejectionEvent) => {
+      event.preventDefault();
+      setError(String(event.reason?.message ?? event.reason));
     };
-  }, [reload, upsert]);
+    window.addEventListener("bdm:error", onError);
+    window.addEventListener("unhandledrejection", onRejected);
+    return () => {
+      offSettings();
+      window.removeEventListener("bdm:update", onUpd);
+      window.removeEventListener("bdm:error", onError);
+      window.removeEventListener("unhandledrejection", onRejected);
+    };
+  }, []);
 
   const allTasks = useMemo(() => Array.from(tasks.values()), [tasks]);
 
@@ -89,23 +83,33 @@ export default function App() {
     () =>
       allTasks.filter((t) => {
         switch (filter.kind) {
-          case "all": return true;
-          case "active": return t.status !== "completed";
-          case "done": return t.status === "completed";
-          case "category": return t.category === filter.name;
+          case "all":
+            return true;
+          case "active":
+            return t.status !== "completed";
+          case "done":
+            return t.status === "completed";
+          case "category":
+            return t.category === filter.name;
         }
       }),
-    [allTasks, filter]
+    [allTasks, filter],
   );
 
-  const selected = selectedId ? tasks.get(selectedId) ?? null : null;
-  const detailsTask = detailsId ? tasks.get(detailsId) ?? null : null;
-  const totalSpeed = allTasks.reduce((sum, t) => sum + (t.status === "downloading" ? t.speed : 0), 0);
+  const selected = selectedId ? (tasks.get(selectedId) ?? null) : null;
+  const detailsTask = detailsId ? (tasks.get(detailsId) ?? null) : null;
+  const totalSpeed = allTasks.reduce(
+    (sum, t) => sum + (t.status === "downloading" ? t.speed : 0),
+    0,
+  );
   const activeCount = allTasks.filter((t) => t.status === "downloading").length;
   const hasCompleted = allTasks.some((t) => t.status === "completed");
 
-  const canResume = !!selected && ["paused", "error", "queued"].includes(selected.status);
-  const canStop = !!selected && ["downloading", "connecting", "queued"].includes(selected.status);
+  const canResume =
+    !!selected && ["paused", "error", "queued"].includes(selected.status);
+  const canStop =
+    !!selected &&
+    ["downloading", "connecting", "queued"].includes(selected.status);
 
   const openAdd = async () => {
     let url = "";
@@ -119,12 +123,13 @@ export default function App() {
   };
 
   const deleteCompleted = () => {
-    for (const t of allTasks) if (t.status === "completed") api.removeTask(t.id, false);
+    for (const t of allTasks)
+      if (t.status === "completed") api.removeTask(t.id, false);
   };
 
-  const copyUrl = (url: string) => {
+  const copyUrl = useCallback((url: string) => {
     navigator.clipboard?.writeText(url).catch(() => {});
-  };
+  }, []);
 
   const ignoreExt = async () => {
     if (settings) {
@@ -147,6 +152,11 @@ export default function App() {
 
   return (
     <div className="app">
+      {error && (
+        <div className="app-error" role="alert" onClick={() => setError("")}>
+          {error} ×
+        </div>
+      )}
       <MenuBar
         menus={[
           {
@@ -157,7 +167,11 @@ export default function App() {
               { label: t("menu.startAll"), onClick: () => api.startAll() },
               { label: t("menu.pauseAll"), onClick: () => api.pauseAll() },
               { label: "", separator: true },
-              { label: t("menu.deleteCompleted"), onClick: deleteCompleted, disabled: !hasCompleted },
+              {
+                label: t("menu.deleteCompleted"),
+                onClick: deleteCompleted,
+                disabled: !hasCompleted,
+              },
             ],
           },
           {
@@ -194,17 +208,22 @@ export default function App() {
       />
 
       <div className="body">
-        <Sidebar categories={categories} tasks={allTasks} filter={filter} onSelect={setFilter} />
+        <Sidebar
+          categories={categories}
+          tasks={allTasks}
+          filter={filter}
+          onSelect={setFilter}
+        />
         <TaskTable
           tasks={filtered}
           selectedId={selectedId}
           onSelect={setSelectedId}
-          onResume={(id) => api.startTask(id)}
-          onPause={(id) => api.pauseTask(id)}
-          onRemove={(id, del) => api.removeTask(id, del)}
-          onOpenFile={(id) => api.openFile(id)}
-          onOpenFolder={(id) => api.openFolder(id)}
-          onDetails={(id) => setDetailsId(id)}
+          onResume={api.startTask}
+          onPause={api.pauseTask}
+          onRemove={api.removeTask}
+          onOpenFile={api.openFile}
+          onOpenFolder={api.openFolder}
+          onDetails={setDetailsId}
           onCopyUrl={copyUrl}
         />
       </div>
@@ -213,39 +232,63 @@ export default function App() {
         <span>{t("status.total", { n: allTasks.length })}</span>
         <span>{t("status.active", { n: activeCount })}</span>
         <span className="sb-grow" />
-        {totalSpeed > 0 && <span className="sb-speed">↓ {formatSpeed(totalSpeed)}</span>}
+        {totalSpeed > 0 && (
+          <span className="sb-speed">↓ {formatSpeed(totalSpeed)}</span>
+        )}
       </div>
 
       {showOptions && (
-        <OptionsDialog onClose={() => setShowOptions(false)} onSaved={(s) => setSettings(s)} />
+        <OptionsDialog
+          onClose={() => setShowOptions(false)}
+          onSaved={(s) => setSettings(s)}
+        />
       )}
 
       {detailsTask && (
         <ProgressDialog
           task={detailsTask}
-          onResume={(id) => api.startTask(id)}
-          onPause={(id) => api.pauseTask(id)}
+          onResume={api.startTask}
+          onPause={api.pauseTask}
           onClose={() => setDetailsId(null)}
         />
       )}
 
       {extPrompt && (
-        <ExtPromptDialog onLater={() => setExtPrompt(false)} onIgnore={ignoreExt} />
+        <ExtPromptDialog
+          onLater={() => setExtPrompt(false)}
+          onIgnore={ignoreExt}
+        />
       )}
 
       {update && <UpdateDialog info={update} onClose={() => setUpdate(null)} />}
 
       {showAbout && (
         <div className="overlay" onMouseDown={() => setShowAbout(false)}>
-          <div className="dialog" style={{ width: 380 }} onMouseDown={(e) => e.stopPropagation()}>
+          <div
+            className="dialog"
+            style={{ width: 380 }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
             <div className="titlebar">{t("about.title")}</div>
-            <div className="content" style={{ textAlign: "center", lineHeight: 1.8 }}>
-              <div style={{ fontSize: 16, fontWeight: 600 }}>Better Download Manager</div>
+            <div
+              className="content"
+              style={{ textAlign: "center", lineHeight: 1.8 }}
+            >
+              <div style={{ fontSize: 16, fontWeight: 600 }}>
+                Better Download Manager
+              </div>
               <div>{t("about.version", { v: APP_VERSION })}</div>
-              <div style={{ color: "var(--muted)", fontSize: 12 }}>{t("about.tagline")}</div>
+              <div style={{ color: "var(--muted)", fontSize: 12 }}>
+                {t("about.tagline")}
+              </div>
             </div>
             <div className="actions">
-              <button className="btn primary" onClick={() => setShowAbout(false)}>{t("common.ok")}</button>
+              <button
+                className="btn primary"
+                onClick={() => setShowAbout(false)}
+              >
+                {t("common.ok")}
+              </button>
             </div>
           </div>
         </div>

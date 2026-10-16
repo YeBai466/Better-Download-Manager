@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
 
 // DownloadRequest is the payload posted by the browser extension.
 type DownloadRequest struct {
+	RequestID string            `json:"requestId,omitempty"`
 	URL       string            `json:"url"`
 	Filename  string            `json:"filename"`
 	Referrer  string            `json:"referrer"`
@@ -26,9 +29,11 @@ type DownloadRequest struct {
 
 // Server is the local browser-integration endpoint. It binds only to loopback.
 type Server struct {
-	onDownload func(DownloadRequest)
+	onDownload func(DownloadRequest) error
 	version    string
 
+	opMu    sync.Mutex
+	lookup  func(string) (Receipt, error)
 	mu      sync.Mutex
 	srv     *http.Server
 	port    int
@@ -38,7 +43,12 @@ type Server struct {
 // New creates a takeover server. onDownload is invoked for each intercepted
 // download (it should return quickly; heavy work belongs on another goroutine).
 func New(version string, onDownload func(DownloadRequest)) *Server {
-	return &Server{onDownload: onDownload, version: version}
+	return NewWithHandler(version, func(r DownloadRequest) error {
+		if onDownload != nil {
+			onDownload(r)
+		}
+		return nil
+	}, nil)
 }
 
 // Running reports whether the server is currently listening.
@@ -58,58 +68,68 @@ func (s *Server) Port() int {
 // Start binds the server to 127.0.0.1:port. It is a no-op if already running on
 // the same port; if running on a different port it is restarted.
 func (s *Server) Start(port int) error {
-	s.mu.Lock()
-	if s.running {
-		if s.port == port {
-			s.mu.Unlock()
-			return nil
-		}
-		s.mu.Unlock()
-		_ = s.Stop()
-		s.mu.Lock()
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid port")
 	}
-
+	s.mu.Lock()
+	if s.running && s.port == port {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	// Bind before retiring the old listener: a failed hot change keeps it alive.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return fmt.Errorf("takeover listen: %w", err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", s.handlePing)
 	mux.HandleFunc("/download", s.handleDownload)
-
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("takeover listen: %w", err)
-	}
-	srv := &http.Server{Handler: withCORS(mux), ReadHeaderTimeout: 10 * time.Second}
+	mux.HandleFunc("/download/status", s.handleStatus)
+	srv := &http.Server{Handler: withCORS(mux), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second}
+	s.mu.Lock()
+	old := s.srv
 	s.srv = srv
 	s.port = port
 	s.running = true
 	s.mu.Unlock()
-
 	go func() {
 		_ = srv.Serve(ln)
 		s.mu.Lock()
-		s.running = false
+		if s.srv == srv {
+			s.running = false
+		}
 		s.mu.Unlock()
 	}()
-	return nil
+	return stopServer(old)
 }
-
-// Stop gracefully shuts the server down.
-func (s *Server) Stop() error {
-	s.mu.Lock()
-	srv := s.srv
-	s.srv = nil
-	s.running = false
-	s.mu.Unlock()
+func stopServer(srv *http.Server) error {
 	if srv == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	return srv.Shutdown(ctx)
+	err := srv.Shutdown(ctx)
+	if err != nil {
+		_ = srv.Close()
+	}
+	return err
+}
+func (s *Server) Stop() error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.mu.Lock()
+	srv := s.srv
+	s.srv = nil
+	s.running = false
+	s.mu.Unlock()
+	return stopServer(srv)
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"app": "Better Download Manager", "version": s.version})
+	writeJSON(w, map[string]string{"app": "Better Download Manager", "version": s.version, "protocol": "2"})
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -122,14 +142,18 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.URL == "" {
+	u, err := url.Parse(req.URL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || len(req.RequestID) > 128 {
 		http.Error(w, "missing url", http.StatusBadRequest)
 		return
 	}
 	if s.onDownload != nil {
-		s.onDownload(req)
+		if err := s.onDownload(req); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	writeJSON(w, Receipt{OK: true, Accepted: true, RequestID: req.RequestID, State: "accepted"})
 }
 
 // withCORS allows browser-extension origins to call the loopback API and answers
@@ -150,4 +174,32 @@ func withCORS(next http.Handler) http.Handler {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+type Receipt struct {
+	OK        bool   `json:"ok"`
+	Accepted  bool   `json:"accepted"`
+	RequestID string `json:"requestId"`
+	State     string `json:"state"`
+}
+
+func NewWithHandler(version string, handler func(DownloadRequest) error, lookup func(string) (Receipt, error)) *Server {
+	return &Server{version: version, onDownload: handler, lookup: lookup}
+}
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("requestId"))
+	if id == "" || len(id) > 128 || s.lookup == nil {
+		http.Error(w, "unknown request", 404)
+		return
+	}
+	receipt, err := s.lookup(id)
+	if err != nil {
+		http.Error(w, err.Error(), 503)
+		return
+	}
+	writeJSON(w, receipt)
 }

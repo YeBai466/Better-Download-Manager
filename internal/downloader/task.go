@@ -33,6 +33,8 @@ type Segment struct {
 // Chunk is a resumable byte range used by the dynamic scheduler. Unlike
 // Segment, which is now just a UI lane, chunks are the durable download plan.
 type Chunk struct {
+	// Keep newly split tail work separate until idle workers have claimed it.
+	split      bool
 	Index      int   `json:"index"`
 	Start      int64 `json:"start"`
 	End        int64 `json:"end"`
@@ -181,6 +183,11 @@ func (t *Task) snapshotLocked() TaskInfo {
 		f := t.FinishedAt
 		info.FinishedAt = &f
 	}
+	if t.Status == StatusCompleted {
+		info.Progress = 1
+		info.ETASeconds = 0
+		info.Speed = 0
+	}
 	// Per-thread display: with the work-stealing engine, t.Segments are workers
 	// (each stamped with the whole-file range), so dividing a worker's scattered
 	// bytes by the whole file would make every bar stall at its share. Present the
@@ -240,6 +247,7 @@ func (t *Task) setStatus(s Status, errMsg string) {
 	t.Error = errMsg
 	if s == StatusCompleted {
 		t.FinishedAt = time.Now()
+		t.Speed = 0
 	}
 	t.mu.Unlock()
 }

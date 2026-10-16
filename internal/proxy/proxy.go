@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,8 +56,7 @@ func Apply(tr *http.Transport, s Settings) error {
 func applyCustom(tr *http.Transport, s Settings) error {
 	raw := strings.TrimSpace(s.URL)
 	if raw == "" {
-		tr.Proxy = nil
-		return nil
+		return fmt.Errorf("custom proxy URL is required")
 	}
 	if !strings.Contains(raw, "://") {
 		raw = "http://" + raw // default scheme
@@ -64,6 +64,9 @@ func applyCustom(tr *http.Transport, s Settings) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	if err := s.Validate(); err != nil {
+		return err
 	}
 	if s.Username != "" {
 		u.User = url.UserPassword(s.Username, s.Password)
@@ -75,8 +78,9 @@ func applyCustom(tr *http.Transport, s Settings) error {
 		return nil
 	case "socks5", "socks5h":
 		var auth *xproxy.Auth
-		if s.Username != "" {
-			auth = &xproxy.Auth{User: s.Username, Password: s.Password}
+		if u.User != nil {
+			password, _ := u.User.Password()
+			auth = &xproxy.Auth{User: u.User.Username(), Password: password}
 		}
 		// Forward through a bounded net.Dialer: xproxy.Direct has no timeout,
 		// so a dead/black-holed proxy would hang the dial phase forever — the
@@ -102,4 +106,39 @@ func applyCustom(tr *http.Transport, s Settings) error {
 	default:
 		return fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 	}
+}
+
+func (s Settings) Validate() error {
+	switch s.Mode {
+	case "", ModeNone, ModeSystem:
+		return nil
+	case ModeCustom:
+	default:
+		return fmt.Errorf("invalid proxy mode")
+	}
+	raw := strings.TrimSpace(s.URL)
+	if raw == "" {
+		return fmt.Errorf("custom proxy URL is required")
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid proxy URL")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fmt.Errorf("unsupported proxy scheme")
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid proxy port")
+		}
+	} else if strings.HasPrefix(strings.ToLower(u.Scheme), "socks5") {
+		return fmt.Errorf("SOCKS5 proxy requires a port")
+	}
+	return nil
 }

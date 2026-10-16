@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status     TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS handoffs (id TEXT PRIMARY KEY, data TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -106,7 +107,7 @@ func (s *Store) LoadSettings() (config.Settings, error) {
 	if err != nil {
 		return config.Settings{}, err
 	}
-	var cfg config.Settings
+	cfg := config.Default()
 	if err := json.Unmarshal([]byte(value), &cfg); err != nil {
 		return config.Default(), nil // tolerate corrupt settings
 	}

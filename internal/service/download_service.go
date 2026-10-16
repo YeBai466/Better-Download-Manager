@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 
 	cat "github.com/yebai/better-download-manager/internal/category"
 	"github.com/yebai/better-download-manager/internal/config"
@@ -57,13 +59,16 @@ const StoreExtensionID = "hgkakilajhnbpmhmpcnblioiiaomdkjp"
 // DownloadService is the primary Wails service. It owns the engine, store and
 // takeover server and exposes methods to the frontend.
 type DownloadService struct {
-	store    *store.Store
-	engine   *downloader.Engine
-	takeover *takeover.Server
+	handoffMu sync.Mutex
+	store     *store.Store
+	engine    *downloader.Engine
+	takeover  *takeover.Server
 
 	extFiles fs.FS  // bundled chromium extension files (for manual "Load unpacked")
 	keyDir   string // app data dir (also where the extension is extracted)
 
+	settingsMu  sync.Mutex
+	updateMu    sync.Mutex
 	mu          sync.RWMutex
 	settings    config.Settings
 	pendingAdds map[string]AddPrefill // per-window prefill, keyed by the add window's unique name
@@ -80,9 +85,10 @@ type DownloadService struct {
 
 // AddPrefill is the data shown in the separate add-download window.
 type AddPrefill struct {
-	URL      string            `json:"url"`
-	Filename string            `json:"filename"`
-	Headers  map[string]string `json:"headers"`
+	HandoffID string            `json:"handoffId,omitempty"`
+	URL       string            `json:"url"`
+	Filename  string            `json:"filename"`
+	Headers   map[string]string `json:"headers"`
 }
 
 // New constructs the service backed by a database at dbPath. extFiles is the
@@ -101,15 +107,17 @@ func New(dbPath string, extFiles fs.FS) (*DownloadService, error) {
 	s := &DownloadService{store: st, settings: settings, extFiles: extFiles, keyDir: filepath.Dir(dbPath), pendingAdds: make(map[string]AddPrefill)}
 
 	s.engine = downloader.NewEngine(downloader.Config{
-		MaxConcurrent:  settings.MaxConcurrent,
-		MaxConnections: settings.MaxConcurrent * settings.Connections,
-		SpeedLimit:     settings.SpeedLimit,
-		ClientFactory:  s.newClientForProxy,
-		OnUpdate:       s.onTaskUpdate,
-		OnPersist:      s.onTaskPersist,
-		OnRemoved:      s.onTaskRemoved,
+		AdaptiveConnections: settings.AdaptiveConnections,
+		MaxConcurrent:       settings.MaxConcurrent,
+		MaxConnections:      settings.MaxConcurrent * settings.Connections,
+		SpeedLimit:          settings.SpeedLimit,
+		ClientFactory:       s.newClientForProxy,
+		OnUpdate:            s.onTaskUpdate,
+		Persist:             s.store.SaveTask,
+		RemoveRecord:        s.store.DeleteTask,
+		OnRemoved:           s.onTaskRemoved,
 	})
-	s.takeover = takeover.New(Version, s.onTakeover)
+	s.takeover = takeover.NewWithHandler(Version, s.acceptHandoff, s.handoffStatus)
 	return s, nil
 }
 
@@ -137,13 +145,14 @@ func (s *DownloadService) ServiceStartup(ctx context.Context, _ application.Serv
 			fmt.Println("takeover server:", err)
 		}
 	}
-	return nil
+	return s.restoreHandoffs()
 }
 
 // ServiceShutdown stops downloads and releases resources.
 func (s *DownloadService) ServiceShutdown() error {
-	s.engine.Shutdown()
 	_ = s.takeover.Stop()
+	s.engine.Shutdown()
+	s.invalidateClient()
 	return s.store.Close()
 }
 
@@ -212,14 +221,7 @@ func (s *DownloadService) onTaskUpdate(info downloader.TaskInfo) {
 	}
 }
 
-func (s *DownloadService) onTaskPersist(rec downloader.Record) {
-	if err := s.store.SaveTask(rec); err != nil {
-		fmt.Println("save task:", err)
-	}
-}
-
 func (s *DownloadService) onTaskRemoved(id string) {
-	_ = s.store.DeleteTask(id)
 	if app := application.Get(); app != nil {
 		app.Event.Emit(EventTaskRemoved, id)
 	}
@@ -229,6 +231,7 @@ func (s *DownloadService) onTaskRemoved(id string) {
 
 // AddRequest describes a download to add from the UI or the add dialog.
 type AddRequest struct {
+	HandoffID     string            `json:"handoffId,omitempty"`
 	URL           string            `json:"url"`
 	Filename      string            `json:"filename"`
 	Category      string            `json:"category"`
@@ -242,13 +245,25 @@ type AddRequest struct {
 
 // AddURL registers a new download and returns its task info.
 func (s *DownloadService) AddURL(req AddRequest) (downloader.TaskInfo, error) {
+	parsedURL, parseErr := url.Parse(strings.TrimSpace(req.URL))
+	if parseErr != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return downloader.TaskInfo{}, fmt.Errorf("HTTP(S) URL is required")
+	}
+	req.URL = parsedURL.String()
 	if strings.TrimSpace(req.URL) == "" {
 		return downloader.TaskInfo{}, fmt.Errorf("url is required")
+	}
+	if req.Connections < 0 || req.Connections > 32 {
+		return downloader.TaskInfo{}, fmt.Errorf("connections must be 1–32")
+	}
+	if err := req.Proxy.Validate(); err != nil {
+		return downloader.TaskInfo{}, err
 	}
 	filename := req.Filename
 	if filename == "" {
 		filename = filenameFromURL(req.URL)
 	}
+	filename = downloader.SanitizeFilename(filename)
 	category := req.Category
 	if category == "" {
 		category = cat.Resolve(filename, "")
@@ -275,10 +290,27 @@ func (s *DownloadService) AddURL(req AddRequest) (downloader.TaskInfo, error) {
 	// alone are a TOCTOU race between two adds of the same filename.
 	s.pathMu.Lock()
 	defer s.pathMu.Unlock()
+	id := newID()
+	if req.HandoffID != "" {
+		if len(req.HandoffID) > 128 {
+			return downloader.TaskInfo{}, fmt.Errorf("invalid handoff ID")
+		}
+		h, found, err := s.store.Handoff(req.HandoffID)
+		if err != nil {
+			return downloader.TaskInfo{}, err
+		}
+		if !found || h.State == "cancelled" {
+			return downloader.TaskInfo{}, fmt.Errorf("handoff is no longer pending")
+		}
+		id = "handoff-" + req.HandoffID
+		if existing, err := s.engine.Get(id); err == nil {
+			return existing, nil
+		}
+	}
 	savePath := s.uniqueSavePath(filepath.Join(saveDir, filename))
 
-	return s.engine.Add(downloader.AddOptions{
-		ID:          newID(),
+	info, err := s.engine.Add(downloader.AddOptions{
+		ID:          id,
 		URL:         req.URL,
 		Filename:    filepath.Base(savePath),
 		SavePath:    savePath,
@@ -288,6 +320,16 @@ func (s *DownloadService) AddURL(req AddRequest) (downloader.TaskInfo, error) {
 		Proxy:       taskProxy,
 		AutoStart:   req.AutoStart,
 	})
+	if err == nil && req.HandoffID != "" {
+		h, _, loadErr := s.store.Handoff(req.HandoffID)
+		if loadErr != nil {
+			return info, loadErr
+		}
+		h.State = "task"
+		h.Request = nil
+		err = s.store.SaveHandoff(h)
+	}
+	return info, err
 }
 
 // uniqueSavePath picks a path not used by any file on disk (final, .part or
@@ -298,7 +340,7 @@ func (s *DownloadService) uniqueSavePath(path string) string {
 		active[strings.ToLower(filepath.Clean(t.SavePath))] = true
 	}
 	occupied := func(p string) bool {
-		if active[strings.ToLower(filepath.Clean(p))] {
+		if active[strings.ToLower(filepath.Clean(p))] || s.engine.PathOccupied(p) {
 			return true
 		}
 		for _, probe := range []string{p, downloader.PartPath(p), downloader.MetaPath(p)} {
@@ -362,6 +404,12 @@ func (s *DownloadService) openAddWindow(p AddPrefill) {
 		BackgroundColour: application.NewRGB(245, 246, 248),
 		URL:              "/?view=add&w=" + name,
 	})
+	w.RegisterHook(events.Common.WindowClosing, func(*application.WindowEvent) {
+		_ = s.CancelHandoff(p.HandoffID)
+		s.mu.Lock()
+		delete(s.pendingAdds, name)
+		s.mu.Unlock()
+	})
 	w.Show()
 	w.Focus()
 	go resetTopmost(w)
@@ -373,7 +421,8 @@ func resetTopmost(w application.Window) {
 }
 
 // ListTasks returns all tasks in insertion order.
-func (s *DownloadService) ListTasks() []downloader.TaskInfo { return s.engine.List() }
+func (s *DownloadService) ListTasks() []downloader.TaskInfo               { return s.engine.List() }
+func (s *DownloadService) GetTask(id string) (downloader.TaskInfo, error) { return s.engine.Get(id) }
 
 // StartTask queues a paused/errored task.
 func (s *DownloadService) StartTask(id string) error { return s.engine.Start(id) }
@@ -427,7 +476,7 @@ func (s *DownloadService) ProbeURL(req ProbeRequest) (Preview, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	res, err := downloader.Probe(ctx, s.newClientForProxy(s.normalizeTaskProxy(req.Proxy)), url, req.Headers)
+	res, err := s.engine.Probe(ctx, s.newClientForProxy(s.normalizeTaskProxy(req.Proxy)), url, req.Headers)
 	if err != nil {
 		return Preview{}, err
 	}
@@ -448,7 +497,7 @@ func (s *DownloadService) ProbeURL(req ProbeRequest) (Preview, error) {
 func (s *DownloadService) GetSettings() config.Settings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.settings
+	return s.settings.Clone()
 }
 
 // tr returns the English string when the saved UI language is "en", otherwise
@@ -465,27 +514,46 @@ func (s *DownloadService) tr(zh, en string) string {
 
 // SaveSettings persists new settings and applies side effects (takeover server).
 func (s *DownloadService) SaveSettings(cfg config.Settings) (config.Settings, error) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	return s.saveSettingsLocked(cfg)
+}
+func (s *DownloadService) saveSettingsLocked(cfg config.Settings) (config.Settings, error) {
+	if err := cfg.Validate(); err != nil {
+		return s.GetSettings(), err
+	}
 	cfg.Normalize()
+	cfg = cfg.Clone()
+	old := s.GetSettings()
+	applyTakeover := func(next config.Settings) error {
+		if next.TakeoverEnabled {
+			return s.takeover.Start(next.TakeoverPort)
+		}
+		return s.takeover.Stop()
+	}
+	if err := applyTakeover(cfg); err != nil {
+		return old, err
+	}
 	if err := s.store.SaveSettings(cfg); err != nil {
-		return config.Settings{}, err
+		_ = applyTakeover(old)
+		return old, err
 	}
 	s.mu.Lock()
 	s.settings = cfg
 	s.mu.Unlock()
-	s.engine.UpdateRuntime(downloader.RuntimeConfig{
-		MaxConcurrent:  cfg.MaxConcurrent,
-		MaxConnections: cfg.MaxConcurrent * cfg.Connections,
-		SpeedLimit:     cfg.SpeedLimit,
-	})
-	s.invalidateClient() // proxy may have changed; rebuild the pooled client
-
-	if cfg.TakeoverEnabled {
-		_ = s.takeover.Start(cfg.TakeoverPort)
-	} else {
-		_ = s.takeover.Stop()
+	s.engine.UpdateRuntime(downloader.RuntimeConfig{AdaptiveConnections: cfg.AdaptiveConnections,
+		MaxConcurrent: cfg.MaxConcurrent, MaxConnections: cfg.MaxConcurrent * cfg.Connections, SpeedLimit: cfg.SpeedLimit})
+	// Tasks retain their selected proxy and its pool; unrelated settings do not
+	// tear down warm connections. Pools are closed during service shutdown.
+	if old.AutoStart != cfg.AutoStart || old.StartMinimized != cfg.StartMinimized {
+		if err := s.applyAutostart(cfg.AutoStart); err != nil {
+			return cfg.Clone(), fmt.Errorf("settings saved; autostart: %w", err)
+		}
 	}
-	s.applyAutostart(cfg.AutoStart)
-	return cfg, nil
+	if app := application.Get(); app != nil {
+		app.Event.Emit("settings:changed", cfg)
+	}
+	return cfg.Clone(), nil
 }
 
 func (s *DownloadService) normalizeTaskProxy(p proxy.Settings) proxy.Settings {
@@ -501,31 +569,19 @@ func (s *DownloadService) normalizeTaskProxy(p proxy.Settings) proxy.Settings {
 }
 
 func (s *DownloadService) saveProxySettings(p proxy.Settings) error {
-	s.mu.RLock()
-	cfg := s.settings
-	s.mu.RUnlock()
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	cfg := s.GetSettings()
 	cfg.Proxy = p
-	cfg.Normalize()
-	if err := s.store.SaveSettings(cfg); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.settings = cfg
-	s.mu.Unlock()
-	s.engine.UpdateRuntime(downloader.RuntimeConfig{
-		MaxConcurrent:  cfg.MaxConcurrent,
-		MaxConnections: cfg.MaxConcurrent * cfg.Connections,
-		SpeedLimit:     cfg.SpeedLimit,
-	})
-	s.invalidateClient()
-	return nil
+	_, err := s.saveSettingsLocked(cfg)
+	return err
 }
 
 // applyAutostart registers or removes the login autostart entry to match cfg.
-func (s *DownloadService) applyAutostart(enabled bool) {
+func (s *DownloadService) applyAutostart(enabled bool) error {
 	app := application.Get()
 	if app == nil || app.Autostart == nil {
-		return
+		return nil
 	}
 	cur, _ := app.Autostart.IsEnabled()
 	if enabled {
@@ -539,13 +595,14 @@ func (s *DownloadService) applyAutostart(enabled bool) {
 		}
 		s.mu.RUnlock()
 		if err := app.Autostart.EnableWithOptions(opts); err != nil {
-			fmt.Println("autostart enable:", err)
+			return err
 		}
 	} else if cur {
 		if err := app.Autostart.Disable(); err != nil {
-			fmt.Println("autostart disable:", err)
+			return err
 		}
 	}
+	return nil
 }
 
 // CheckForUpdates queries GitHub Releases and returns version + notes. The bool
@@ -553,18 +610,14 @@ func (s *DownloadService) applyAutostart(enabled bool) {
 func (s *DownloadService) CheckForUpdates() (updates.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	return updates.Check(ctx, Version)
+	return updates.CheckWithClient(ctx, Version, s.newClient())
 }
 
-// DownloadUpdate downloads the new release's installer directly into a "tmp"
-// folder under the app's own install directory (NOT as a regular download task),
-// then launches it through the shell so Windows shows the UAC prompt the
-// admin-level NSIS installer requires. The installer closes the running app
-// itself (taskkill) and upgrades in place; on the next launch the updated app
-// wipes the leftover tmp folder via CleanupUpdateTmp. Returns an error (so the
-// UI can fall back to the release page) when no installer URL is available or
-// the download/launch fails. Blocks until the installer has been launched.
+// DownloadUpdate uses a private, user-writable cache and checkpoints active
+// downloads before handing the installer to the Windows shell.
 func (s *DownloadService) DownloadUpdate(downloadURL string) error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
 	url := strings.TrimSpace(downloadURL)
 	if url == "" {
 		return fmt.Errorf("没有可用的安装包下载地址")
@@ -589,21 +642,20 @@ func (s *DownloadService) DownloadUpdate(downloadURL string) error {
 		return fmt.Errorf("下载安装包失败: %w", err)
 	}
 
+	s.engine.PauseAllAndWait()
 	if err := openInShell(dest); err != nil {
 		return fmt.Errorf("启动安装程序失败: %w", err)
 	}
 	return nil
 }
 
-// updateTmpDir returns "<installDir>/tmp" — the folder update installers are
-// downloaded into. The install directory is the directory of the running
-// executable.
+// updateTmpDir is owned exclusively by the in-app updater.
 func (s *DownloadService) updateTmpDir() (string, error) {
-	exe, err := os.Executable()
+	root, err := os.UserCacheDir()
 	if err != nil {
-		return "", fmt.Errorf("无法定位程序目录: %w", err)
+		return "", err
 	}
-	return filepath.Join(filepath.Dir(exe), "tmp"), nil
+	return filepath.Join(root, "BetterDownloadManager", "updates"), nil
 }
 
 // CleanupUpdateTmp removes the update "tmp" folder (and any installer left in
@@ -820,7 +872,7 @@ func (s *DownloadService) OpenFolder(id string) error {
 
 // --- Takeover handling ---
 
-func (s *DownloadService) onTakeover(req takeover.DownloadRequest) {
+func (s *DownloadService) dispatchTakeover(req takeover.DownloadRequest) error {
 	headers := map[string]string{}
 	for k, v := range req.Headers {
 		headers[k] = v
@@ -840,14 +892,15 @@ func (s *DownloadService) onTakeover(req takeover.DownloadRequest) {
 	s.mu.RUnlock()
 
 	if action == config.ActionAutoStart {
-		_, _ = s.AddURL(AddRequest{
+		_, err := s.AddURL(AddRequest{HandoffID: req.RequestID,
 			URL: req.URL, Filename: req.Filename, Headers: headers, AutoStart: true,
 		})
-		return
+		return err
 	}
 
 	// Dialog mode: open the dedicated add window prefilled with the request.
-	s.openAddWindow(AddPrefill{URL: req.URL, Filename: req.Filename, Headers: headers})
+	s.openAddWindow(AddPrefill{HandoffID: req.RequestID, URL: req.URL, Filename: req.Filename, Headers: headers})
+	return nil
 }
 
 func (s *DownloadService) focusWindow() {
@@ -876,11 +929,6 @@ func (s *DownloadService) resolveDir(category string) string {
 	return filepath.Join(cfg.DownloadDir, cat.DefaultSubfolder(category))
 }
 
-func openInShell(path string) error {
-	// "" is the title argument for cmd's start command.
-	return exec.Command("cmd", "/c", "start", "", filepath.Clean(path)).Start()
-}
-
 func newID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -888,17 +936,13 @@ func newID() string {
 }
 
 func filenameFromURL(rawURL string) string {
-	u := rawURL
-	if i := strings.IndexAny(u, "?#"); i >= 0 {
-		u = u[:i]
-	}
-	u = strings.TrimRight(u, "/")
-	base := u
-	if i := strings.LastIndex(u, "/"); i >= 0 {
-		base = u[i+1:]
-	}
-	if base == "" {
+	u, err := url.Parse(rawURL)
+	if err != nil {
 		return "download"
 	}
-	return base
+	name := path.Base(u.Path)
+	if name == "" || name == "." || name == "/" {
+		return "download"
+	}
+	return downloader.SanitizeFilename(name)
 }

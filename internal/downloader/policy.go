@@ -109,6 +109,10 @@ func newSpeedLimiter(rate int64) *speedLimiter {
 
 func (l *speedLimiter) SetRate(rate int64) {
 	l.mu.Lock()
+	if l.rate == rate {
+		l.mu.Unlock()
+		return
+	}
 	l.rate = rate
 	close(l.changed)
 	l.changed = make(chan struct{})

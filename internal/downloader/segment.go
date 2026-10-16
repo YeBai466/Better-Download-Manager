@@ -16,6 +16,7 @@ import (
 var transferBuffers = sync.Pool{New: func() any { b := make([]byte, 256<<10); return &b }}
 
 var errStalled = errors.New("download stalled")
+var errRangeContinue = errors.New("continue shortened range")
 
 type transferPlan struct {
 	workers int
@@ -205,10 +206,12 @@ func chunkRegions(n, workers int) [][2]int {
 // already-open whole-file response through contiguous chunks instead of paying
 // a request round-trip (and often a fresh connection) per chunk.
 type chunkQueue struct {
-	mu         sync.Mutex
-	chunks     []*Chunk
-	claimed    []bool
-	holdLowest bool
+	activeSince     map[int]time.Time
+	activeRemaining map[int]int64
+	mu              sync.Mutex
+	chunks          []*Chunk
+	claimed         []bool
+	holdLowest      bool
 	// regions[i] is worker i's home territory. Workers start spread across the
 	// file instead of all claiming from the front, so every connection — and
 	// every thread bar in the UI — is live from the first second.
@@ -405,7 +408,7 @@ func downloadChunkWithRetry(
 			return err
 		}
 		last = err
-		if opts.Failures != nil {
+		if opts.Failures != nil && !errors.Is(err, errRangeContinue) {
 			opts.Failures.Add(1)
 		}
 		if chunk.Current() > start {
@@ -435,54 +438,6 @@ func downloadChunkWithRetry(
 		}
 	}
 	return fmt.Errorf("chunk %d failed after retries: %w", chunk.Index, last)
-}
-
-// downloadSegment is kept for older tests/helpers and the legacy transfer path.
-// The engine's active path uses downloadChunkWithRetry and dynamic chunks.
-func downloadSegment(
-	ctx context.Context,
-	client *http.Client,
-	rawURL string,
-	headers map[string]string,
-	seg *Segment,
-	w *fileWriter,
-	ranged bool,
-	progress *int64,
-) error {
-	if ranged {
-		chunk := &Chunk{Index: seg.Index, Start: seg.Start, End: seg.End, Downloaded: seg.loaded()}
-		opts := transferOptions{Retries: defaultRetries, StallTimeout: defaultStallTimeout, Identity: responseIdentity{TotalSize: seg.End + 1}}
-		return downloadChunkWithRetry(ctx, client, newURLHolder(rawURL, rawURL, headers), headers, chunk, seg, w, progress, opts)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return err
-	}
-	applyHeaders(req, headers)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return fmt.Errorf("expected 200 OK, got %s", resp.Status)
-	}
-	chunk := &Chunk{Index: seg.Index, Start: 0, End: seg.End, Downloaded: seg.loaded()}
-	return streamOpenResponse(ctx, resp, chunk, seg, w, progress, transferOptions{StallTimeout: defaultStallTimeout}, seg.End >= 0)
-}
-
-// streamSegment is kept for the legacy fast-start path; new downloads use
-// streamChunks / copyBody directly with Chunk state.
-func streamSegment(
-	ctx context.Context,
-	resp *http.Response,
-	seg *Segment,
-	w *fileWriter,
-	ranged bool,
-	progress *int64,
-) error {
-	chunk := &Chunk{Index: seg.Index, Start: seg.Start, End: seg.End, Downloaded: seg.loaded()}
-	return streamOpenResponse(ctx, resp, chunk, seg, w, progress, transferOptions{StallTimeout: defaultStallTimeout}, ranged && seg.End >= 0)
 }
 
 func downloadChunk(
@@ -545,7 +500,12 @@ func downloadChunk(
 	if err := validatePartialResponse(resp, chunk.Current(), chunk.End, opts.Identity); err != nil {
 		return err
 	}
-	return copyBody(reqCtx, resp.Body, chunk.Current(), chunk, lane, w, progress, localOpts, true)
+	err = copyBody(reqCtx, resp.Body, chunk.Current(), chunk, lane, w, progress, localOpts, true)
+	_, responseEnd, _, _ := parseContentRange(resp.Header.Get("Content-Range"))
+	if errors.Is(err, io.ErrUnexpectedEOF) && responseEnd < chunk.End && chunk.Current() == responseEnd+1 {
+		return errRangeContinue
+	}
+	return err
 }
 
 // streamChunks consumes consecutive chunks from an already-open whole-file
@@ -783,34 +743,6 @@ func buildWorkerLanes(totalSize int64, n int) []*Segment {
 		lanes[i] = &Segment{Index: i, Start: 0, End: end}
 	}
 	return lanes
-}
-
-// buildSegments splits totalSize into n UI lanes.
-func buildSegments(totalSize int64, n int) []*Segment {
-	if n < 1 {
-		n = 1
-	}
-	if totalSize <= 0 {
-		return []*Segment{{Index: 0, Start: 0, End: -1}}
-	}
-	if int64(n) > totalSize {
-		n = int(totalSize)
-		if n < 1 {
-			n = 1
-		}
-	}
-	segs := make([]*Segment, n)
-	base := totalSize / int64(n)
-	var start int64
-	for i := 0; i < n; i++ {
-		end := start + base - 1
-		if i == n-1 {
-			end = totalSize - 1
-		}
-		segs[i] = &Segment{Index: i, Start: start, End: end}
-		start = end + 1
-	}
-	return segs
 }
 
 func validatePartialResponse(resp *http.Response, start, end int64, id responseIdentity) error {

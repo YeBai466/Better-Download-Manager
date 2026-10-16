@@ -33,7 +33,7 @@ type Config struct {
 	OnUpdate            func(info TaskInfo)               // throttled progress + status changes
 	Persist             func(Record) error
 	RemoveRecord        func(string) error
-	OnPersist           func(rec Record) // durable state changes (status only)
+	OnPersist           func(rec Record) // legacy persistence callback; prefer Persist to report failures
 	OnRemoved           func(id string)  // task removed
 }
 

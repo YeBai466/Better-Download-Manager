@@ -1,13 +1,18 @@
 package downloader
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +26,79 @@ type matrixTransport struct {
 	base    http.RoundTripper
 	started *atomic.Int64
 	first   *atomic.Int64
+}
+
+func BenchmarkMixedQueue(b *testing.B) {
+	data := makeData(64 << 20)
+	sizes := []int{64 << 20, 2 << 20, 64 << 10, 128 << 10, 512 << 10, 4 << 20}
+	var total int64
+	for _, size := range sizes {
+		total += int64(size)
+	}
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		size, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/"))
+		if err != nil || size < 0 || size > len(data) {
+			http.Error(w, "bad size", 400)
+			return
+		}
+		w.Header().Set("ETag", `"mixed"`)
+		http.ServeContent(w, r, "mixed.bin", fixedModTime, newTestReadSeeker(data[:size]))
+	}))
+	defer srv.Close()
+	b.SetBytes(total)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		client, err := httpclient.New(proxy.Settings{Mode: proxy.ModeNone})
+		if err != nil {
+			b.Fatal(err)
+		}
+		updates := make(chan TaskInfo, 512)
+		cfg := Config{MaxConcurrent: 3, MaxConnections: 24, ClientFactory: func(proxy.Settings) *http.Client { return client }, OnUpdate: func(info TaskInfo) {
+			select {
+			case updates <- info:
+			default:
+			}
+		}}
+		if field := reflect.ValueOf(&cfg).Elem().FieldByName("AdaptiveConnections"); field.IsValid() {
+			field.SetBool(true)
+		}
+		e := NewEngine(cfg)
+		dir := b.TempDir()
+		for j, size := range sizes {
+			_, err := e.Add(AddOptions{ID: fmt.Sprint(j), URL: fmt.Sprintf("%s/%d", srv.URL, size), SavePath: filepath.Join(dir, fmt.Sprint(j)), Connections: 8, AutoStart: true})
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		for range sizes {
+			if info := waitBenchDone(b, updates); info.Status != StatusCompleted {
+				b.Fatal(info.Error)
+			}
+		}
+		e.Shutdown()
+		client.CloseIdleConnections()
+		b.StopTimer()
+		for j, size := range sizes {
+			path := filepath.Join(dir, fmt.Sprint(j))
+			f, err := os.Open(path)
+			if err != nil {
+				b.Fatal(err)
+			}
+			h := sha256.New()
+			_, err = io.Copy(h, f)
+			f.Close()
+			expected := sha256.Sum256(data[:size])
+			if err != nil || !bytes.Equal(h.Sum(nil), expected[:]) {
+				b.Fatalf("mixed SHA-256 mismatch: %v", err)
+			}
+			_ = os.Remove(path)
+		}
+		b.StartTimer()
+	}
+	b.ReportMetric(float64(requests.Load())/float64(b.N), "requests/op")
 }
 
 func (tr matrixTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -51,6 +129,13 @@ func BenchmarkTransferMatrix(b *testing.B) {
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
 			block := makeData(64 << 10)
+			expected := sha256.New()
+			for left := tc.size; left > 0; {
+				n := min(left, int64(len(block)))
+				_, _ = expected.Write(block[:n])
+				left -= n
+			}
+			expectedSum := expected.Sum(nil)
 			plan := buildTransferPlan(tc.size, tc.connections)
 			slowStart := int64(-1)
 			if tc.slowTail {
@@ -160,7 +245,19 @@ func BenchmarkTransferMatrix(b *testing.B) {
 				if stat, err := os.Stat(dst); err != nil || stat.Size() != tc.size {
 					b.Fatalf("bad output size: %v", err)
 				}
+				b.StopTimer()
+				file, err := os.Open(dst)
+				if err != nil {
+					b.Fatal(err)
+				}
+				actual := sha256.New()
+				_, err = io.Copy(actual, file)
+				file.Close()
+				if err != nil || !bytes.Equal(actual.Sum(nil), expectedSum) {
+					b.Fatalf("SHA-256 mismatch: %v", err)
+				}
 				_ = os.Remove(dst)
+				b.StartTimer()
 			}
 			b.ReportMetric(float64(requests.Load())/float64(b.N), "requests/op")
 			b.ReportMetric(float64(peak.Load()), "peak-requests")

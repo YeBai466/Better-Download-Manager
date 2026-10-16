@@ -10,6 +10,7 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 
+	"github.com/yebai/better-download-manager/internal/config"
 	"github.com/yebai/better-download-manager/internal/service"
 )
 
@@ -23,6 +24,7 @@ var extAssets embed.FS
 var trayIcon []byte
 
 func init() {
+	application.RegisterEvent[config.Settings]("settings:changed")
 	// Register frontend events so the binding generator produces typed APIs.
 	application.RegisterEvent[any](service.EventTaskUpdate)
 	application.RegisterEvent[string](service.EventTaskRemoved)

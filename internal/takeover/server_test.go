@@ -3,10 +3,12 @@ package takeover
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -20,6 +22,37 @@ func freePort(t *testing.T) int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestHandlerFailureIsNotAcknowledged(t *testing.T) {
+	s := NewWithHandler("1", func(DownloadRequest) error { return errors.New("disk full") }, nil)
+	r := httptest.NewRequest("POST", "/download", bytes.NewBufferString(`{"url":"https://example.com/file","requestId":"one"}`))
+	w := httptest.NewRecorder()
+	s.handleDownload(w, r)
+	if w.Code != 503 {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestFailedPortChangeKeepsOldListener(t *testing.T) {
+	s := New("1", nil)
+	old := freePort(t)
+	if err := s.Start(old); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	if err := s.Start(occupied.Addr().(*net.TCPAddr).Port); err == nil {
+		t.Fatal("expected port conflict")
+	}
+	if !s.Running() || s.Port() != old {
+		t.Fatal("old server was discarded")
+	}
+	waitReady(t, fmt.Sprintf("http://127.0.0.1:%d/ping", old))
 }
 
 func TestServerPingAndDownload(t *testing.T) {

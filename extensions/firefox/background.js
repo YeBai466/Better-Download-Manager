@@ -1,15 +1,7 @@
-// Browser-integration background worker. Intercepts downloads, cancels the
-// browser's own download and forwards the request to the local B Download
-// Manager HTTP endpoint. Works in Chrome/Edge (MV3) and Firefox (the `api`
-// shim picks `browser` when present).
-
+// Pause first; cancel only after the application acknowledges durable receipt.
 const api = typeof browser !== "undefined" ? browser : chrome;
-
 const DEFAULT_PORT = 9614;
-
-// URLs we have deliberately re-issued to the browser (fallback when the app is
-// not running). They must pass through without being intercepted again.
-const bypass = new Set();
+const PENDING_PREFIX = "handoff:";
 
 async function getConfig() {
   const { enabled = true, port = DEFAULT_PORT } = await api.storage.local.get([
@@ -18,74 +10,137 @@ async function getConfig() {
   ]);
   return { enabled, port };
 }
-
-function endpoint(port) {
-  return `http://127.0.0.1:${port}`;
+const endpoint = (port) => `http://127.0.0.1:${port}`;
+const basename = (name) => (name || "").split(/[\\/]/).pop();
+async function request(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(5000),
+  });
+  const body = await response.json().catch(() => ({}));
+  return { response, body };
 }
-
-function basename(p) {
-  if (!p) return "";
-  return p.split(/[\\/]/).pop();
-}
-
 async function collectCookies(url) {
   try {
-    const cookies = await api.cookies.getAll({ url });
-    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    return (await api.cookies.getAll({ url }))
+      .map((c) => `${c.name}=${c.value}`)
+      .join("; ");
   } catch {
     return "";
   }
 }
-
-api.downloads.onCreated.addListener(async (item) => {
+function setBadge(text, color) {
+  const action = api.action || api.browserAction;
+  if (action) {
+    Promise.resolve(action.setBadgeText({ text })).catch(() => {});
+    Promise.resolve(action.setBadgeBackgroundColor({ color })).catch(() => {});
+  }
+}
+async function finish(pending, accepted) {
+  if (accepted) {
+    // A failed cancel must retain the receipt so reconciliation can retry.
+    await api.downloads.cancel(pending.browserId);
+    await api.downloads.erase({ id: pending.browserId }).catch(() => {});
+  } else {
+    await api.downloads.resume(pending.browserId);
+  }
+  await api.storage.local.remove(PENDING_PREFIX + pending.requestId);
+  setBadge(accepted ? "✓" : "", accepted ? "#2db84d" : "#888888");
+}
+async function reconcileOne(pending, explicitFailure = false) {
+  try {
+    const { response, body } = await request(
+      `${endpoint(pending.port)}/download/status?requestId=${encodeURIComponent(pending.requestId)}`,
+    );
+    if (!response.ok) return;
+    if (body.accepted) await finish(pending, true);
+    else if (
+      body.state === "failed" ||
+      (explicitFailure && body.state === "missing")
+    )
+      await finish(pending, false);
+  } catch {
+    setBadge("!", "#d93025");
+  }
+}
+async function reconcile() {
+  const saved = await api.storage.local.get(null);
+  await Promise.allSettled(
+    Object.entries(saved)
+      .filter(([key]) => key.startsWith(PENDING_PREFIX))
+      .map(([, pending]) => reconcileOne(pending)),
+  );
+}
+api.downloads.onCreated.addListener((item) => {
+  intercept(item).catch(() => setBadge("!", "#d93025"));
+});
+async function intercept(item) {
   const url = item.finalUrl || item.url;
   if (!url || !/^https?:/i.test(url)) return;
-
-  if (bypass.has(url)) {
-    bypass.delete(url);
-    return; // our own fallback download — let it proceed
-  }
-
   const { enabled, port } = await getConfig();
   if (!enabled) return;
-
-  // Cancel and remove the browser's download entry.
-  try { await api.downloads.cancel(item.id); } catch {}
-  try { await api.downloads.erase({ id: item.id }); } catch {}
-
+  // If the application is absent, the original browser download keeps running.
+  try {
+    const { response, body } = await request(`${endpoint(port)}/ping`);
+    if (
+      !response.ok ||
+      body.app !== "Better Download Manager" ||
+      body.protocol !== "2"
+    )
+      return;
+  } catch {
+    return;
+  }
+  try {
+    await api.downloads.pause(item.id);
+  } catch {
+    return;
+  }
+  const pending = { requestId: crypto.randomUUID(), browserId: item.id, port };
+  try {
+    await api.storage.local.set({
+      [PENDING_PREFIX + pending.requestId]: pending,
+    });
+  } catch {
+    await api.downloads.resume(item.id);
+    return;
+  }
   const payload = {
+    requestId: pending.requestId,
     url,
-    filename: basename(item.filename) || "",
+    filename: basename(item.filename),
     referrer: item.referrer || "",
     mime: item.mime || "",
-    fileSize: item.fileSize > 0 ? item.fileSize : item.totalBytes > 0 ? item.totalBytes : 0,
+    fileSize: Math.max(0, item.fileSize || item.totalBytes || 0),
     userAgent: navigator.userAgent,
     cookie: await collectCookies(url),
     headers: {},
   };
-
   try {
-    const res = await fetch(`${endpoint(port)}/download`, {
+    const { response, body } = await request(`${endpoint(port)}/download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error(`status ${res.status}`);
-    setBadge("✓", "#2db84d");
-  } catch (e) {
-    // App not reachable: fall back to a normal browser download.
+    if (response.ok && body.accepted && body.requestId === pending.requestId)
+      await finish(pending, true);
+    else await reconcileOne(pending, true);
+  } catch {
+    // The POST may have succeeded before its response was lost. Retain the
+    // paused original until the receipt can be queried, including after restart.
     setBadge("!", "#d93025");
-    bypass.add(url);
-    try { await api.downloads.download({ url }); } catch {}
+    await reconcileOne(pending);
   }
-});
-
-function setBadge(text, color) {
-  const action = api.action || api.browserAction; // MV3 vs Firefox MV2
-  if (!action) return;
-  try {
-    action.setBadgeText({ text });
-    action.setBadgeBackgroundColor({ color });
-    setTimeout(() => action.setBadgeText({ text: "" }), 2500);
-  } catch {}
 }
+api.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "bdm-reconcile") reconcile();
+});
+api.runtime.onStartup.addListener(reconcile);
+api.runtime.onInstalled.addListener(reconcile);
+api.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== "reconcile") return;
+  reconcile().then(() => sendResponse({ ok: true }));
+  return true;
+});
+api.alarms.create("bdm-reconcile", { periodInMinutes: 1 });
+reconcile();
