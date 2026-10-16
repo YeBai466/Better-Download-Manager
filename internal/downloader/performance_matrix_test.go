@@ -43,6 +43,8 @@ func BenchmarkMixedQueue(b *testing.B) {
 			http.Error(w, "bad size", 400)
 			return
 		}
+		// Keep server-side Windows MIME registry initialization out of client timings.
+		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("ETag", `"mixed"`)
 		http.ServeContent(w, r, "mixed.bin", fixedModTime, newTestReadSeeker(data[:size]))
 	}))

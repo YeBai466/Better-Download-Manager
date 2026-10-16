@@ -646,7 +646,8 @@ func copyBody(
 		}
 		// Keep the first packet immediate. Subsequent fragments share one positioned
 		// write, bounded by buffer size, range boundaries and a short progress window.
-		if pending > 0 && (firstWrite || pending == len(buf) || readErr != nil ||
+		// Large ready reads go directly to disk instead of being held for aggregation.
+		if pending > 0 && (firstWrite || n >= 64<<10 || pending == len(buf) || readErr != nil ||
 			(capped && int64(pending) == chunk.Remaining()) || time.Since(lastFlush) >= 16*time.Millisecond) {
 			if err := flush(); err != nil {
 				return err

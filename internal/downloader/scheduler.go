@@ -62,7 +62,8 @@ func (e *Engine) runWorkers(ctx context.Context, client *http.Client, holder *ur
 					results <- workerResult{index, err}
 					return
 				}
-				batch := q.takeBatch(index, 32<<20)
+				// Bound aggregation to two durable chunks so short regions retain work-stealing opportunities.
+				batch := q.takeBatch(index, min(int64(32<<20), 2*smartChunkSize(opts.Identity.TotalSize)))
 				if len(batch) == 0 {
 					results <- workerResult{index, nil}
 					return
