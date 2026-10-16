@@ -31,9 +31,15 @@ func recoverFinalized(t *Task, m *metaFile) bool {
 	if sumChunks(chunks) != m.TotalSize {
 		return false
 	}
-	for _, c := range chunks {
-		if !c.Complete() {
+	if m.TotalSize == 0 {
+		if len(chunks) != 1 || chunks[0].Start != 0 || chunks[0].End != -1 || chunks[0].loaded() != 0 {
 			return false
+		}
+	} else {
+		for _, c := range chunks {
+			if !c.Complete() {
+				return false
+			}
 		}
 	}
 	t.mu.Lock()

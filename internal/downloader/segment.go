@@ -573,15 +573,8 @@ func streamOpenResponse(
 }
 
 func copyBody(
-	ctx context.Context,
-	body io.Reader,
-	offset int64,
-	chunk *Chunk,
-	lane *Segment,
-	w *fileWriter,
-	progress *int64,
-	opts transferOptions,
-	capped bool,
+	ctx context.Context, body io.Reader, offset int64, chunk *Chunk, lane *Segment,
+	w io.WriterAt, progress *int64, opts transferOptions, capped bool,
 ) error {
 	buffer := transferBuffers.Get().(*[]byte)
 	defer transferBuffers.Put(buffer)
@@ -591,7 +584,35 @@ func copyBody(
 		guard = newReadGuard(opts.StallTimeout)
 		defer guard.Close()
 	}
-
+	pending := 0
+	firstWrite := true
+	lastFlush := time.Now()
+	flush := func() error {
+		if pending == 0 {
+			return nil
+		}
+		if _, err := w.WriteAt(buf[:pending], offset); err != nil {
+			return fatalError{err}
+		}
+		if len(opts.Batch) > 0 {
+			for _, part := range opts.Batch {
+				lo, hi := max(offset, part.Start), min(offset+int64(pending), part.End+1)
+				if hi > lo {
+					part.add(hi - lo)
+				}
+			}
+		}
+		offset += int64(pending)
+		chunk.add(int64(pending))
+		if lane != nil {
+			lane.add(int64(pending))
+		}
+		atomic.AddInt64(progress, int64(pending))
+		pending = 0
+		firstWrite = false
+		lastFlush = time.Now()
+		return nil
+	}
 	for {
 		if capped && chunk.Complete() {
 			return nil
@@ -602,19 +623,17 @@ func copyBody(
 			}
 			return err
 		}
-		// Never read past the chunk boundary: a shared streaming response
-		// continues into the next chunk, and over-reading would silently
-		// discard bytes that belong to it.
-		readBuf := buf
+		readBuf := buf[pending:]
 		if capped {
-			if rem := chunk.Remaining(); rem >= 0 && rem < int64(len(readBuf)) {
-				readBuf = readBuf[:rem]
+			// Pending bytes were read but are not yet committed to the chunk counter.
+			remaining := chunk.Remaining() - int64(pending)
+			if remaining < int64(len(readBuf)) {
+				readBuf = readBuf[:remaining]
 			}
 		}
 		guard.Begin(opts.Cancel)
 		n, readErr := body.Read(readBuf)
-		wasStalled := guard.End()
-		if wasStalled {
+		if guard.End() {
 			return errStalled
 		}
 		if n > 0 {
@@ -622,41 +641,27 @@ func copyBody(
 				if err := opts.Limiter.Wait(ctx, n); err != nil {
 					return err
 				}
-				// Time spent sleeping in OUR rate limiter is not a server
-				// stall — re-stamp so a low speed limit can't make the
-				// watchdog kill a perfectly healthy throttled transfer.
 			}
-			if _, werr := w.WriteAt(readBuf[:n], offset); werr != nil {
-				return fatalError{werr}
-			}
-			if len(opts.Batch) > 0 {
-				for _, part := range opts.Batch {
-					lo, hi := max(offset, part.Start), min(offset+int64(n), part.End+1)
-					if hi > lo {
-						part.add(hi - lo)
-					}
-				}
-			}
-			offset += int64(n)
-			chunk.add(int64(n))
-			if lane != nil {
-				lane.add(int64(n))
-			}
-			atomic.AddInt64(progress, int64(n))
-			if capped && chunk.Complete() {
-				return nil
+			pending += n
+		}
+		// Keep the first packet immediate. Subsequent fragments share one positioned
+		// write, bounded by buffer size, range boundaries and a short progress window.
+		if pending > 0 && (firstWrite || pending == len(buf) || readErr != nil ||
+			(capped && int64(pending) == chunk.Remaining()) || time.Since(lastFlush) >= 16*time.Millisecond) {
+			if err := flush(); err != nil {
+				return err
 			}
 		}
+		if capped && chunk.Complete() {
+			return nil
+		}
 		if readErr == io.EOF {
-			if capped && !chunk.Complete() {
+			if capped {
 				return io.ErrUnexpectedEOF
 			}
 			return nil
 		}
 		if readErr != nil {
-			if guard.stalled.Load() {
-				return errStalled
-			}
 			return readErr
 		}
 	}

@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,6 +41,38 @@ func TestUnknownContentRangeRequiresFullResponse(t *testing.T) {
 		t.Fatal(info.Error)
 	}
 	assertFileEquals(t, dst, data)
+}
+
+type fragmentReader struct{ *bytes.Reader }
+
+func (r fragmentReader) Read(p []byte) (int, error) { return r.Reader.Read(p[:min(len(p), 1024)]) }
+
+type countingWriterAt struct {
+	data  []byte
+	calls int
+}
+
+func (w *countingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	w.calls++
+	return copy(w.data[off:], p), nil
+}
+
+func TestCopyBodyCoalescesNetworkFragments(t *testing.T) {
+	data := makeData(1 << 20)
+	w := &countingWriterAt{data: make([]byte, len(data))}
+	chunk := &Chunk{Start: 0, End: int64(len(data)) - 1}
+	var progress int64
+	err := copyBody(context.Background(), fragmentReader{bytes.NewReader(data)}, 0, chunk, nil, w, &progress, transferOptions{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(w.data, data) || chunk.loaded() != int64(len(data)) {
+		t.Fatal("coalescing changed bytes or progress")
+	}
+	t.Logf("1 MiB / 1 KiB fragments: %d positioned writes instead of 1024", w.calls)
+	if w.calls > 8 {
+		t.Fatalf("network fragments still cause tiny writes: %d", w.calls)
+	}
 }
 
 func TestEmptyDownloadReportsCompleteProgress(t *testing.T) {
@@ -129,6 +162,28 @@ func TestRecoverRenameBeforeDatabaseCommit(t *testing.T) {
 		t.Fatal(info.Error)
 	}
 	assertFileEquals(t, dst, data)
+}
+
+func TestRecoverEmptyFileCommitReceipt(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "empty.bin")
+	w, err := openPartFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{URL: "https://example.invalid/empty", SavePath: dst, TotalSize: 0, Chunks: []*Chunk{{Start: 0, End: -1}}}
+	if err := writeMeta(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(w, dst); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := readMeta(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recoverFinalized(task, meta) {
+		t.Fatal("empty commit receipt was not recovered")
+	}
 }
 
 func TestCommitReceiptSurvivesDatabaseFailure(t *testing.T) {
