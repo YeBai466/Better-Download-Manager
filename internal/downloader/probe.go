@@ -10,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ProbeResult holds the metadata discovered about a download target.
@@ -33,6 +34,8 @@ func Probe(ctx context.Context, client *http.Client, rawURL string, headers map[
 // support, filename and content type without downloading the body. A ranged GET
 // is more reliable than HEAD, which many servers handle incorrectly.
 func probe(ctx context.Context, client *http.Client, rawURL string, headers map[string]string) (*ProbeResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -205,13 +208,13 @@ func parseContentRange(cr string) (start, end, total int64, ok bool) {
 	}
 	totalStr := strings.TrimSpace(rest[slash+1:])
 	if totalStr == "*" {
-		return start, end, -1, true
+		return start, end, -1, start >= 0 && end >= start
 	}
 	total, err = strconv.ParseInt(totalStr, 10, 64)
 	if err != nil {
 		return 0, 0, 0, false
 	}
-	return start, end, total, true
+	return start, end, total, start >= 0 && end >= start && total > end
 }
 
 func applyHeaders(req *http.Request, headers map[string]string) {
@@ -234,3 +237,6 @@ func applyHeaders(req *http.Request, headers map[string]string) {
 }
 
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BetterDownloadManager/1.0"
+
+// SanitizeFilename applies the same rules to UI and browser-supplied names.
+func SanitizeFilename(name string) string { return sanitizeFilename(name) }

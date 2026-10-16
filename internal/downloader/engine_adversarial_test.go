@@ -693,8 +693,8 @@ func TestConnectionLimiterNoLeakOnCancel(t *testing.T) {
 		l := newConnectionLimiter(1)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := l.Acquire(ctx); err != nil && len(l.ch) != 0 {
-			t.Fatalf("trial %d: Acquire failed but kept a slot (%d held)", trial, len(l.ch))
+		if err := l.Acquire(ctx); err != nil && l.inUse() != 0 {
+			t.Fatalf("trial %d: Acquire failed but kept a slot (%d held)", trial, l.inUse())
 		}
 	}
 	// A cancelled Acquire must leave the limiter fully usable.

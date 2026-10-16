@@ -90,7 +90,8 @@ type Task struct {
 	// metaMu serializes .bdmeta sidecar writes: the persist ticker, the
 	// transfer-end flush and a pause-path flush can otherwise race on the
 	// shared temp file.
-	metaMu sync.Mutex
+	metaMu     sync.Mutex
+	checkpoint *Record
 
 	ID           string
 	URL          string
@@ -107,18 +108,21 @@ type Task struct {
 	LastModified string
 	FinalURL     string
 
-	Status     Status
-	Error      string
-	Segments   []*Segment // UI lanes; Chunks are the durable transfer ranges.
-	Chunks     []*Chunk
-	Downloaded int64 // aggregate bytes written across all segments
-	Speed      int64 // bytes/sec, exponentially smoothed
-	CreatedAt  time.Time
-	FinishedAt time.Time
+	Revision      uint64
+	CheckpointSeq uint64
+	Status        Status
+	Error         string
+	Segments      []*Segment // UI lanes; Chunks are the durable transfer ranges.
+	Chunks        []*Chunk
+	Downloaded    int64 // aggregate bytes written across all segments
+	Speed         int64 // bytes/sec, exponentially smoothed
+	CreatedAt     time.Time
+	FinishedAt    time.Time
 }
 
 // TaskInfo is the JSON-friendly snapshot handed to the frontend and the store.
 type TaskInfo struct {
+	Revision    uint64     `json:"revision"`
 	ID          string     `json:"id"`
 	URL         string     `json:"url"`
 	Filename    string     `json:"filename"`
@@ -145,6 +149,7 @@ func (t *Task) Snapshot() TaskInfo {
 	defer t.mu.RUnlock()
 
 	info := TaskInfo{
+		Revision:    t.Revision,
 		ID:          t.ID,
 		URL:         t.URL,
 		Filename:    t.Filename,

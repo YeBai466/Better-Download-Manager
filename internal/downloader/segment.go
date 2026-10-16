@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+var transferBuffers = sync.Pool{New: func() any { b := make([]byte, 256<<10); return &b }}
+
 var errStalled = errors.New("download stalled")
 
 type transferPlan struct {
@@ -129,6 +131,8 @@ func (h *urlHolder) refresh(ctx context.Context, client *http.Client, gen int, i
 // resolveFreshURL re-walks the origin's redirect chain and verifies the target
 // still serves the same representation.
 func resolveFreshURL(ctx context.Context, client *http.Client, origin string, headers map[string]string, id responseIdentity) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin, nil)
 	if err != nil {
 		return "", err
@@ -473,12 +477,6 @@ func downloadChunk(
 	progress *int64,
 	opts transferOptions,
 ) error {
-	if opts.Connections != nil {
-		if err := opts.Connections.Acquire(ctx); err != nil {
-			return err
-		}
-		defer opts.Connections.Release()
-	}
 
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -517,6 +515,7 @@ func downloadChunk(
 	case isAuthExpiryStatus(resp.StatusCode) && holder.refreshable(gen):
 		// Likely an expired signed URL: re-resolve through the origin, then
 		// let the retry loop try again against the fresh target.
+		resp.Body.Close()
 		if rerr := holder.refresh(ctx, client, gen, opts.Identity); rerr != nil {
 			return rerr
 		}
@@ -567,6 +566,8 @@ func streamChunks(
 			// The open stream died mid-chunk; finish this chunk on fresh
 			// ranged connections, then hand control back to the caller's
 			// normal per-chunk loop.
+			resp.Body.Close()
+			respCancel()
 			return downloadChunkWithRetry(ctx, client, holder, headers, cur, lane, w, progress, opts)
 		}
 		next := q.nextContiguous(cur.End + 1)
@@ -602,7 +603,9 @@ func copyBody(
 	opts transferOptions,
 	capped bool,
 ) error {
-	buf := make([]byte, copyBufferSize(opts.Limiter))
+	buffer := transferBuffers.Get().(*[]byte)
+	defer transferBuffers.Put(buffer)
+	buf := (*buffer)[:copyBufferSize(opts.Limiter)]
 	stall := opts.StallTimeout
 	if stall <= 0 {
 		stall = defaultStallTimeout
@@ -610,6 +613,7 @@ func copyBody(
 	var lastProgressUnix atomic.Int64
 	lastProgressUnix.Store(time.Now().UnixNano())
 	var stalled atomic.Bool
+	var reading atomic.Bool
 	if opts.Cancel != nil {
 		// Watchdog: body.Read can block forever on a server that sends
 		// headers then goes silent; the only way to unblock it is cancelling
@@ -629,7 +633,7 @@ func copyBody(
 					return
 				case <-ticker.C:
 					last := time.Unix(0, lastProgressUnix.Load())
-					if time.Since(last) > stall {
+					if reading.Load() && time.Since(last) > stall {
 						stalled.Store(true)
 						opts.Cancel()
 						return
@@ -658,7 +662,10 @@ func copyBody(
 				readBuf = readBuf[:rem]
 			}
 		}
+		lastProgressUnix.Store(time.Now().UnixNano())
+		reading.Store(true)
 		n, readErr := body.Read(readBuf)
+		reading.Store(false)
 		if n > 0 {
 			lastProgressUnix.Store(time.Now().UnixNano())
 			if opts.Limiter != nil {
@@ -671,7 +678,7 @@ func copyBody(
 				lastProgressUnix.Store(time.Now().UnixNano())
 			}
 			if _, werr := w.WriteAt(readBuf[:n], offset); werr != nil {
-				return werr
+				return fatalError{werr}
 			}
 			offset += int64(n)
 			chunk.add(int64(n))
@@ -695,9 +702,6 @@ func copyBody(
 				return errStalled
 			}
 			return readErr
-		}
-		if time.Since(time.Unix(0, lastProgressUnix.Load())) > stall {
-			return errStalled
 		}
 	}
 }

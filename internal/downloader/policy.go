@@ -99,15 +99,18 @@ type speedLimiter struct {
 	rate      int64
 	updated   time.Time
 	allowance float64
+	changed   chan struct{}
 }
 
 func newSpeedLimiter(rate int64) *speedLimiter {
-	return &speedLimiter{rate: rate, updated: time.Now()}
+	return &speedLimiter{rate: rate, updated: time.Now(), changed: make(chan struct{})}
 }
 
 func (l *speedLimiter) SetRate(rate int64) {
 	l.mu.Lock()
 	l.rate = rate
+	close(l.changed)
+	l.changed = make(chan struct{})
 	l.updated = time.Now()
 	if rate <= 0 {
 		l.allowance = 0
@@ -158,6 +161,7 @@ func (l *speedLimiter) Wait(ctx context.Context, n int) error {
 		if wait < 10*time.Millisecond {
 			wait = 10 * time.Millisecond
 		}
+		changed := l.changed
 		l.mu.Unlock()
 
 		timer := time.NewTimer(wait)
@@ -166,19 +170,31 @@ func (l *speedLimiter) Wait(ctx context.Context, n int) error {
 			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
+		case <-changed:
+			timer.Stop()
 		}
 	}
 }
 
 type connectionLimiter struct {
-	ch chan struct{}
+	mu            sync.Mutex
+	limit, active int
+	lastOwner     string
+	waiters       []*connectionWaiter
+}
+
+type connectionOwnerKey struct{}
+type connectionWaiter struct {
+	owner   string
+	ready   chan struct{}
+	granted bool
 }
 
 func newConnectionLimiter(n int) *connectionLimiter {
 	if n < 1 {
 		n = DefaultConnections
 	}
-	return &connectionLimiter{ch: make(chan struct{}, n)}
+	return &connectionLimiter{limit: n}
 }
 
 // Acquire takes a connection slot. On error no slot is held: winning the send
@@ -188,26 +204,79 @@ func (l *connectionLimiter) Acquire(ctx context.Context) error {
 	if l == nil {
 		return ctx.Err()
 	}
-	select {
-	case l.ch <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			l.Release()
-			return err
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	owner, _ := ctx.Value(connectionOwnerKey{}).(string)
+	w := &connectionWaiter{owner: owner, ready: make(chan struct{})}
+	l.mu.Lock()
+	l.waiters = append(l.waiters, w)
+	l.dispatchLocked()
+	l.mu.Unlock()
+	select {
+	case <-w.ready:
+	case <-ctx.Done():
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		if w.granted {
+			l.active--
+		} else {
+			for i, candidate := range l.waiters {
+				if candidate == w {
+					l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+					break
+				}
+			}
+		}
+		l.dispatchLocked()
+		return err
+	}
+	return nil
+}
+
+func (l *connectionLimiter) dispatchLocked() {
+	for l.active < l.limit && len(l.waiters) > 0 {
+		i := 0
+		for j, w := range l.waiters {
+			if w.owner != l.lastOwner {
+				i = j
+				break
+			}
+		}
+		w := l.waiters[i]
+		l.waiters = append(l.waiters[:i], l.waiters[i+1:]...)
+		w.granted = true
+		l.active++
+		l.lastOwner = w.owner
+		close(w.ready)
+	}
+}
+
+func (l *connectionLimiter) SetLimit(n int) {
+	l.mu.Lock()
+	l.limit = max(1, n)
+	l.dispatchLocked()
+	l.mu.Unlock()
+}
+
+func (l *connectionLimiter) inUse() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.active
 }
 
 func (l *connectionLimiter) Release() {
 	if l == nil {
 		return
 	}
-	select {
-	case <-l.ch:
-	default:
+	l.mu.Lock()
+	if l.active > 0 {
+		l.active--
 	}
+	l.dispatchLocked()
+	l.mu.Unlock()
 }
 
 func minInt(a, b int) int {

@@ -52,8 +52,7 @@ func removeFinal(savePath string) {
 	_ = os.Remove(savePath)
 }
 
-// finalize closes the file and renames the .part file to its final name,
-// replacing any existing file at the destination.
+// The destination may have appeared after task admission. Never delete it.
 func finalize(w *fileWriter, savePath string) error {
 	if err := w.f.Sync(); err != nil {
 		w.f.Close()
@@ -62,6 +61,5 @@ func finalize(w *fileWriter, savePath string) error {
 	if err := w.f.Close(); err != nil {
 		return err
 	}
-	_ = os.Remove(savePath)
-	return os.Rename(w.partPath, savePath)
+	return renameNoReplace(w.partPath, savePath)
 }

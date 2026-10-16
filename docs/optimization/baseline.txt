@@ -1,0 +1,21 @@
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkDownloadEngine/small-range-12         	       3	  13573200 ns/op	 154.51 MB/s	  549797 B/op	     284 allocs/op
+BenchmarkDownloadEngine/small-range-12         	       3	  10091333 ns/op	 207.82 MB/s	  551832 B/op	     290 allocs/op
+BenchmarkDownloadEngine/small-range-12         	       3	  11545400 ns/op	 181.64 MB/s	  550306 B/op	     282 allocs/op
+BenchmarkDownloadEngine/small-range-12         	       3	  28145200 ns/op	  74.51 MB/s	  552405 B/op	     281 allocs/op
+BenchmarkDownloadEngine/small-range-12         	       3	  27169433 ns/op	  77.19 MB/s	  546829 B/op	     277 allocs/op
+BenchmarkDownloadEngine/large-range-12         	       3	 136509667 ns/op	 491.61 MB/s	 4244501 B/op	    2396 allocs/op
+BenchmarkDownloadEngine/large-range-12         	       3	 125729500 ns/op	 533.76 MB/s	 4231714 B/op	    2356 allocs/op
+BenchmarkDownloadEngine/large-range-12         	       3	 123840800 ns/op	 541.90 MB/s	 4225792 B/op	    2326 allocs/op
+BenchmarkDownloadEngine/large-range-12         	       3	 138487100 ns/op	 484.59 MB/s	 4239488 B/op	    2374 allocs/op
+BenchmarkDownloadEngine/large-range-12         	       3	 123528200 ns/op	 543.27 MB/s	 4234376 B/op	    2315 allocs/op
+BenchmarkDownloadEngine/no-range-12            	       3	  24377033 ns/op	 344.12 MB/s	  544578 B/op	     258 allocs/op
+BenchmarkDownloadEngine/no-range-12            	       3	  20190033 ns/op	 415.48 MB/s	  544786 B/op	     258 allocs/op
+BenchmarkDownloadEngine/no-range-12            	       3	  19877400 ns/op	 422.02 MB/s	  544434 B/op	     257 allocs/op
+BenchmarkDownloadEngine/no-range-12            	       3	  20299333 ns/op	 413.25 MB/s	  546986 B/op	     258 allocs/op
+BenchmarkDownloadEngine/no-range-12            	       3	  14759767 ns/op	 568.34 MB/s	  548336 B/op	     263 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	4.485s

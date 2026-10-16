@@ -2,7 +2,9 @@ package downloader
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -15,18 +17,19 @@ const partSuffix = ".part"
 
 // metaFile is the on-disk resume record for a partially downloaded file.
 type metaFile struct {
-	Version      int       `json:"version"`
-	URL          string    `json:"url"`
-	FinalURL     string    `json:"finalUrl"`
-	TotalSize    int64     `json:"totalSize"`
-	Resumable    bool      `json:"resumable"`
-	Filename     string    `json:"filename"`
-	MIME         string    `json:"mime"`
-	ETag         string    `json:"etag"`
-	LastModified string    `json:"lastModified"`
-	ValidatedAt  time.Time `json:"validatedAt"`
-	Segments     []Segment `json:"segments"`
-	Chunks       []Chunk   `json:"chunks"`
+	CheckpointSeq uint64    `json:"checkpointSeq,omitempty"`
+	Version       int       `json:"version"`
+	URL           string    `json:"url"`
+	FinalURL      string    `json:"finalUrl"`
+	TotalSize     int64     `json:"totalSize"`
+	Resumable     bool      `json:"resumable"`
+	Filename      string    `json:"filename"`
+	MIME          string    `json:"mime"`
+	ETag          string    `json:"etag"`
+	LastModified  string    `json:"lastModified"`
+	ValidatedAt   time.Time `json:"validatedAt"`
+	Segments      []Segment `json:"segments"`
+	Chunks        []Chunk   `json:"chunks"`
 }
 
 func metaPath(savePath string) string { return savePath + metaSuffix }
@@ -39,43 +42,69 @@ func MetaPath(savePath string) string { return metaPath(savePath) }
 
 // writeMeta persists the current segment progress next to the partial file.
 func writeMeta(t *Task) error {
-	t.mu.RLock()
-	m := metaFile{
-		Version:      2,
-		URL:          t.URL,
-		FinalURL:     t.FinalURL,
-		TotalSize:    t.TotalSize,
-		Resumable:    t.Resumable,
-		Filename:     t.Filename,
-		MIME:         t.MIME,
-		ETag:         t.ETag,
-		LastModified: t.LastModified,
-		ValidatedAt:  time.Now(),
-		Segments:     make([]Segment, len(t.Segments)),
-		Chunks:       make([]Chunk, len(t.Chunks)),
+	t.metaMu.Lock()
+	defer t.metaMu.Unlock()
+	r := t.Record()
+	r.CheckpointSeq++
+	// Snapshot first, then flush: metadata must never claim bytes newer than Sync.
+	f, err := os.OpenFile(partPath(r.SavePath), os.O_RDWR, 0)
+	if err != nil {
+		return err
 	}
-	for i, s := range t.Segments {
-		m.Segments[i] = Segment{Index: s.Index, Start: s.Start, End: s.End, Downloaded: s.loaded()}
+	err = f.Sync()
+	closeErr := f.Close()
+	if err != nil {
+		return err
 	}
-	for i, c := range t.Chunks {
-		m.Chunks[i] = Chunk{Index: c.Index, Start: c.Start, End: c.End, Downloaded: c.loaded()}
+	if closeErr != nil {
+		return closeErr
 	}
-	path := metaPath(t.SavePath)
-	t.mu.RUnlock()
-
+	m := metaFile{Version: 2, CheckpointSeq: r.CheckpointSeq, URL: r.URL, FinalURL: r.FinalURL,
+		TotalSize: r.TotalSize, Resumable: r.Resumable, Filename: r.Filename, MIME: r.MIME,
+		ETag: r.ETag, LastModified: r.LastModified, ValidatedAt: time.Now(), Segments: r.Segments, Chunks: r.Chunks}
 	data, err := json.Marshal(&m)
 	if err != nil {
 		return err
 	}
-	// Serialize the write+rename: the persist ticker, transfer-end flush and
-	// pause-path flush share one temp file per task.
-	t.metaMu.Lock()
-	defer t.metaMu.Unlock()
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	path := metaPath(r.SavePath)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".bdmeta-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err = tmp.Write(data); err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		return fmt.Errorf("replace metadata: %w", err)
+	}
+	t.mu.Lock()
+	t.CheckpointSeq = r.CheckpointSeq
+	t.mu.Unlock()
+	t.checkpoint = &r
+	return nil
+}
+
+// DurableRecord combines current lifecycle state with the last flushed byte map.
+func (t *Task) DurableRecord() Record {
+	t.metaMu.Lock()
+	defer t.metaMu.Unlock()
+	r := t.Record()
+	if c := t.checkpoint; c != nil {
+		r.CheckpointSeq, r.Chunks, r.Segments = c.CheckpointSeq, c.Chunks, c.Segments
+		r.Downloaded = 0
+		for _, chunk := range c.Chunks {
+			r.Downloaded += chunk.Downloaded
+		}
+	}
+	return r
 }
 
 // readMeta loads resume state for a target path, if present.

@@ -43,6 +43,9 @@ type Engine struct {
 	order       []string
 	activeCount int
 	closed      bool
+	wg          sync.WaitGroup
+	emitMu      sync.Mutex
+	retired     map[string]bool
 
 	limiter     *speedLimiter
 	connections *connectionLimiter
@@ -89,6 +92,7 @@ func NewEngine(cfg Config) *Engine {
 		tasks:       map[string]*managed{},
 		limiter:     newSpeedLimiter(cfg.SpeedLimit),
 		connections: newConnectionLimiter(cfg.MaxConnections),
+		retired:     map[string]bool{},
 	}
 }
 
@@ -97,8 +101,7 @@ var ErrNotFound = errors.New("task not found")
 
 // UpdateRuntime applies settings that can change while the app is running.
 // Speed limits apply to in-flight transfers immediately (shared limiter); a
-// changed connection cap only applies to transfers started afterwards — the
-// old limiter stays with running workers so its accounting stays consistent.
+// the shared connection budget is resized in place without losing active leases.
 func (e *Engine) UpdateRuntime(rt RuntimeConfig) {
 	rt = normalizeRuntimeConfig(rt)
 	e.mu.Lock()
@@ -108,7 +111,7 @@ func (e *Engine) UpdateRuntime(rt RuntimeConfig) {
 	e.cfg.Retries = rt.Retries
 	e.cfg.StallTimeout = rt.StallTimeout
 	e.cfg.MetaInterval = rt.MetaInterval
-	e.connections = newConnectionLimiter(rt.MaxConnections)
+	e.connections.SetLimit(rt.MaxConnections)
 	e.mu.Unlock()
 	e.limiter.SetRate(rt.SpeedLimit)
 	e.schedule()
@@ -133,6 +136,7 @@ func (e *Engine) Add(opts AddOptions) (TaskInfo, error) {
 	if conns < 1 {
 		conns = DefaultConnections
 	}
+	conns = min(conns, 32)
 	t := &Task{
 		ID:          opts.ID,
 		URL:         opts.URL,
@@ -141,12 +145,15 @@ func (e *Engine) Add(opts AddOptions) (TaskInfo, error) {
 		Category:    opts.Category,
 		TotalSize:   -1,
 		Connections: conns,
-		Headers:     opts.Headers,
+		Headers:     cloneHeaders(opts.Headers),
 		Proxy:       opts.Proxy,
 		Status:      StatusQueued,
 		CreatedAt:   time.Now(),
 	}
 
+	if !opts.AutoStart {
+		t.Status = StatusPaused
+	}
 	e.mu.Lock()
 	if e.closed {
 		e.mu.Unlock()
@@ -174,7 +181,7 @@ func (e *Engine) Add(opts AddOptions) (TaskInfo, error) {
 
 // Restore re-registers a persisted task (e.g. on startup) without auto-starting.
 func (e *Engine) Restore(t *Task) {
-	if t.Status == StatusDownloading || t.Status == StatusConnecting {
+	if t.Status == StatusDownloading || t.Status == StatusConnecting || t.Status == StatusQueued {
 		t.Status = StatusPaused // we were not cleanly stopped
 	}
 	e.mu.Lock()
@@ -191,15 +198,21 @@ func (e *Engine) Restore(t *Task) {
 func (e *Engine) Start(id string) error {
 	e.mu.Lock()
 	m, ok := e.tasks[id]
-	e.mu.Unlock()
 	if !ok {
+		e.mu.Unlock()
 		return ErrNotFound
 	}
+	if e.closed {
+		e.mu.Unlock()
+		return errors.New("engine closed")
+	}
 	switch m.task.getStatus() {
-	case StatusDownloading, StatusConnecting, StatusCompleted:
+	case StatusDownloading, StatusConnecting, StatusCompleted, StatusQueued:
+		e.mu.Unlock()
 		return nil
 	}
 	m.task.setStatus(StatusQueued, "")
+	e.mu.Unlock()
 	e.emitManaged(m)
 	e.schedule()
 	return nil
@@ -212,82 +225,97 @@ func (e *Engine) Start(id string) error {
 func (e *Engine) Pause(id string) error {
 	e.mu.Lock()
 	m, ok := e.tasks[id]
-	e.mu.Unlock()
 	if !ok {
+		e.mu.Unlock()
 		return ErrNotFound
 	}
-	for {
-		switch m.task.getStatus() {
-		case StatusDownloading, StatusConnecting:
-			// Re-read the cancel func under the engine lock: the launch that
-			// flipped the status also assigned it, possibly after our first
-			// read of m.
-			e.mu.Lock()
-			cancel := m.cancel
-			e.mu.Unlock()
-			if cancel != nil {
-				cancel()
-			}
-			m.task.recalcDownloaded() // reflect current segment progress immediately
-			m.task.mu.Lock()
-			m.task.Speed = 0
-			m.task.mu.Unlock()
-			m.task.setStatus(StatusPaused, "")
-			e.emitManaged(m)
-			return nil
-		case StatusQueued:
-			// CAS so a concurrent launch can't overwrite the pause: if the
-			// worker won the race and already flipped Queued->Connecting, loop
-			// and take the cancel path instead.
-			if m.task.casStatus(StatusQueued, StatusPaused) {
-				e.emitManaged(m)
-				return nil
-			}
-		default:
-			return nil
+	switch m.task.getStatus() {
+	case StatusQueued, StatusConnecting, StatusDownloading:
+		if m.cancel != nil {
+			m.cancel()
 		}
+		m.task.mu.Lock()
+		m.task.Status, m.task.Speed = StatusPaused, 0
+		m.task.mu.Unlock()
+		m.task.recalcDownloaded()
+	default:
+		e.mu.Unlock()
+		return nil
 	}
+	running := m.running
+	e.mu.Unlock()
+	// Worker shutdown checkpoints the progress; UI feedback never waits for disk.
+	e.emitUpdate(m.task)
+	if !running {
+		e.emitManaged(m)
+	}
+	return nil
 }
 
 // Remove cancels (if running) and deletes a task. It returns immediately; the
 // worker is cancelled and file cleanup (when deleteFile is set) runs in the
 // background once the worker has fully stopped, so the UI updates instantly.
 func (e *Engine) Remove(id string, deleteFile bool) error {
+	e.emitMu.Lock()
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		e.emitMu.Unlock()
+		return errors.New("engine closed")
+	}
 	m, ok := e.tasks[id]
 	if !ok {
 		e.mu.Unlock()
+		e.emitMu.Unlock()
 		return ErrNotFound
 	}
 	m.removed = true
 	delete(e.tasks, id)
+	e.retired[m.task.SavePath] = true
 	for i, oid := range e.order {
 		if oid == id {
 			e.order = append(e.order[:i], e.order[i+1:]...)
 			break
 		}
 	}
-	cancel := m.cancel
-	done := m.done
-	running := m.running
-	e.mu.Unlock()
-
-	if running && cancel != nil {
-		cancel()
+	if m.cancel != nil {
+		m.cancel()
 	}
+	done, running := m.done, m.running
+	e.wg.Add(1)
+	e.mu.Unlock()
 	e.cfg.OnRemoved(id)
-
+	e.emitMu.Unlock()
 	go func() {
-		if running && done != nil {
-			<-done // let the worker finish writing before we touch the files
+		defer e.wg.Done()
+		if running {
+			<-done
 		}
 		if deleteFile {
 			removeFinal(m.task.SavePath)
 			removeMeta(m.task.SavePath)
 			removePartial(m.task.SavePath)
 		}
+		e.mu.Lock()
+		delete(e.retired, m.task.SavePath)
+		e.mu.Unlock()
 	}()
 	return nil
+}
+
+// PathOccupied includes paths awaiting asynchronous deletion.
+func (e *Engine) PathOccupied(path string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.retired[path] {
+		return true
+	}
+	for _, m := range e.tasks {
+		if strings.EqualFold(m.task.SavePath, path) {
+			return true
+		}
+	}
+	return false
 }
 
 // List returns snapshots of all tasks in insertion order.
@@ -316,29 +344,21 @@ func (e *Engine) Get(id string) (TaskInfo, error) {
 
 // Shutdown pauses all active tasks and prevents new ones from starting.
 func (e *Engine) Shutdown() {
-	// Snapshot cancel/done under the lock: a worker's deferred cleanup writes
-	// m.cancel concurrently (also under the lock).
-	type stopper struct {
-		cancel context.CancelFunc
-		done   chan struct{}
-	}
 	e.mu.Lock()
 	e.closed = true
-	running := make([]stopper, 0)
 	for _, m := range e.tasks {
-		if m.running {
-			running = append(running, stopper{cancel: m.cancel, done: m.done})
+		if m.cancel != nil {
+			m.cancel()
+		}
+		if m.task.getStatus() != StatusCompleted && m.task.getStatus() != StatusError {
+			m.task.setStatus(StatusPaused, "")
 		}
 	}
 	e.mu.Unlock()
-	for _, s := range running {
-		if s.cancel != nil {
-			s.cancel()
-		}
-	}
-	for _, s := range running {
-		<-s.done
-	}
+	e.wg.Wait()
+	// Serialize with the last callback before the owner closes its database.
+	e.emitMu.Lock()
+	e.emitMu.Unlock()
 }
 
 // schedule launches queued tasks until the concurrency limit is reached.
@@ -365,33 +385,38 @@ func (e *Engine) schedule() {
 
 // launchLocked starts a task's worker. Caller must hold e.mu.
 func (e *Engine) launchLocked(m *managed) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), connectionOwnerKey{}, m.task.ID))
 	m.cancel = cancel
 	m.done = make(chan struct{})
 	m.running = true
 	e.activeCount++
-	go e.run(ctx, m)
+	e.wg.Add(1)
+	go e.run(ctx, m, m.done)
 }
 
 // run performs the full download for one task and reschedules on completion.
-func (e *Engine) run(ctx context.Context, m *managed) {
+func (e *Engine) run(ctx context.Context, m *managed, done chan struct{}) {
+	defer e.wg.Done()
 	t := m.task
 	defer func() {
 		e.mu.Lock()
 		m.running = false
 		m.cancel = nil
 		e.activeCount--
+		close(done)
 		e.mu.Unlock()
-		close(m.done)
 		e.schedule()
 	}()
 
 	// Queued->Connecting is a CAS: a Pause that landed between scheduling and
 	// this goroutine starting must win, not be silently clobbered.
-	if !t.casStatus(StatusQueued, StatusConnecting) {
+	e.mu.Lock()
+	if ctx.Err() != nil || !t.casStatus(StatusQueued, StatusConnecting) {
+		e.mu.Unlock()
 		return
 	}
-	client := e.cfg.ClientFactory(t.Proxy)
+	e.mu.Unlock()
+	client := e.budgetClient(e.cfg.ClientFactory(t.Proxy))
 	e.emitManaged(m)
 
 	// One transparent restart when the remote content changed mid-transfer
@@ -445,7 +470,10 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 
 	var xferErr error
 	if resumable {
-		t.setStatus(StatusDownloading, "")
+		if err := e.markDownloading(ctx, m); err != nil {
+			w.Close()
+			return err
+		}
 		e.emitManaged(m)
 		xferErr = e.transferV2(ctx, client, t, w)
 	} else {
@@ -453,7 +481,9 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 	}
 	if xferErr != nil {
 		w.Close()
-		_ = writeMeta(t)
+		if err := writeMeta(t); err != nil {
+			return fmt.Errorf("%v; checkpoint: %w", xferErr, err)
+		}
 		return xferErr
 	}
 	// Completeness gate. Workers only return nil once their chunk is full, so
@@ -463,7 +493,9 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 	// check costs one in-memory pass plus a Stat.
 	if err := verifyComplete(t); err != nil {
 		w.Close()
-		_ = writeMeta(t)
+		if checkpointErr := writeMeta(t); checkpointErr != nil {
+			return fmt.Errorf("%v; checkpoint: %w", err, checkpointErr)
+		}
 		return err
 	}
 	return finalize(w, t.SavePath)
@@ -492,7 +524,11 @@ func verifyComplete(t *Task) error {
 	if got != total {
 		return fmt.Errorf("incomplete transfer: %d of %d bytes", got, total)
 	}
-	if info, err := os.Stat(partPath(savePath)); err == nil && info.Size() != total {
+	info, err := os.Stat(partPath(savePath))
+	if err != nil {
+		return err
+	}
+	if info.Size() != total {
 		return fmt.Errorf("partial file is %d bytes, expected %d", info.Size(), total)
 	}
 	return nil
@@ -509,6 +545,18 @@ func (e *Engine) loadResume(ctx context.Context, client *http.Client, t *Task) (
 	ranged := t.Resumable
 	t.mu.RUnlock()
 
+	if meta, err := readMeta(t.SavePath); err == nil {
+		t.mu.RLock()
+		seq := t.CheckpointSeq
+		t.mu.RUnlock()
+		if meta.CheckpointSeq > seq {
+			ok, err := e.applyMetaIfSafe(ctx, client, t, meta)
+			if err != nil || ok {
+				t.recalcDownloaded()
+				return ok, err
+			}
+		}
+	}
 	if hasChunks && ranged {
 		ok, err := e.validateResume(ctx, client, t)
 		if err != nil {
@@ -557,6 +605,7 @@ func (e *Engine) applyMetaIfSafe(ctx context.Context, client *http.Client, t *Ta
 		return false, nil
 	}
 	t.mu.Lock()
+	t.CheckpointSeq = m.CheckpointSeq
 	t.TotalSize = m.TotalSize
 	t.Resumable = m.Resumable
 	t.MIME = m.MIME
@@ -593,11 +642,13 @@ func (e *Engine) applyMetaIfSafe(ctx context.Context, client *http.Client, t *Ta
 // check could not be completed — a network blip or a transient 5xx must never
 // be mistaken for "the file changed", or the user loses their progress.
 func (e *Engine) validateResume(ctx context.Context, client *http.Client, t *Task) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	t.mu.RLock()
 	total := t.TotalSize
 	ranged := t.Resumable
 	url := t.URL
-	headers := t.headersCopy()
+	headers := cloneHeaders(t.Headers)
 	chunks := append([]*Chunk(nil), t.Chunks...)
 	storedETag := t.ETag
 	storedLM := t.LastModified
@@ -610,7 +661,7 @@ func (e *Engine) validateResume(ctx context.Context, client *http.Client, t *Tas
 	if err != nil || info.Size() > total {
 		return false, nil
 	}
-	if sumChunks(chunks) > info.Size() {
+	if !validChunkLayout(chunks, total, info.Size()) {
 		return false, nil
 	}
 
@@ -633,14 +684,14 @@ func (e *Engine) validateResume(ctx context.Context, client *http.Client, t *Tas
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
 		resp.Body.Close()
 	}()
-	if isTransientStatus(resp.StatusCode) {
+	if isTransientStatus(resp.StatusCode) || isAuthExpiryStatus(resp.StatusCode) {
 		return false, fmt.Errorf("server returned %s", resp.Status)
 	}
 	if resp.StatusCode != http.StatusPartialContent {
 		return false, nil
 	}
-	_, _, remoteTotal, ok := parseContentRange(resp.Header.Get("Content-Range"))
-	if !ok || remoteTotal != total {
+	rs, re, remoteTotal, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || rs != 0 || re != 0 || remoteTotal != total {
 		return false, nil
 	}
 	respETag := resp.Header.Get("ETag")
@@ -654,7 +705,9 @@ func (e *Engine) validateResume(ctx context.Context, client *http.Client, t *Tas
 	// Same-size content swaps are invisible on a server that exposes no
 	// validators at all — spot-check by refetching the tail of the largest
 	// downloaded chunk and comparing it with the bytes on disk.
-	if storedETag == "" && storedLM == "" && respETag == "" && respLM == "" {
+	strongMatch := storedETag != "" && !strings.HasPrefix(strings.ToLower(storedETag), "w/") && storedETag == respETag
+	dateMatch := storedLM != "" && storedLM == respLM
+	if !strongMatch && !dateMatch {
 		matched, serr := sampleMatchesPart(ctx, client, url, headers, savePath, chunks)
 		if serr != nil {
 			return false, serr
@@ -724,7 +777,7 @@ func sampleMatchesPart(ctx context.Context, client *http.Client, url string, hea
 		return false, err
 	}
 	defer resp.Body.Close()
-	if isTransientStatus(resp.StatusCode) {
+	if isTransientStatus(resp.StatusCode) || isAuthExpiryStatus(resp.StatusCode) {
 		return false, fmt.Errorf("server returned %s", resp.Status)
 	}
 	if resp.StatusCode != http.StatusPartialContent {
@@ -758,6 +811,9 @@ func (e *Engine) migrateSegmentsToChunks(t *Task) {
 }
 
 func (e *Engine) resetPartial(t *Task) {
+	t.metaMu.Lock()
+	t.checkpoint = nil
+	t.metaMu.Unlock()
 	removeMeta(t.SavePath)
 	removePartial(t.SavePath)
 	t.resetTransferState()
@@ -884,7 +940,7 @@ func confirmRangeSupport(ctx context.Context, client *http.Client, url string, h
 }
 
 func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, w *fileWriter, m *managed) error {
-	headers := t.headersCopy()
+	headers := cloneHeaders(t.Headers)
 	url := t.URL
 
 	// tctx cancels every sibling worker (and unblocks the streamer's body
@@ -899,10 +955,12 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 		return err
 	}
 
+	defer func() { resp.Body.Close(); respCancel() }()
+
 	total := int64(-1)
 	ranged := false
 	if resp.StatusCode == http.StatusPartialContent {
-		rs, re, n, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		rs, _, n, ok := parseContentRange(resp.Header.Get("Content-Range"))
 		if !ok {
 			resp.Body.Close()
 			return fmt.Errorf("missing or invalid Content-Range in %s response", resp.Status)
@@ -916,11 +974,15 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 		if n > 0 {
 			total = n
 			ranged = true
-		} else if re >= 0 {
-			// "bytes 0-x/*": the server honoured the open range but doesn't
-			// know the total — the range end still tells us the full size.
-			total = re + 1
-			ranged = true
+		} else {
+			resp.Body.Close()
+			respCancel()
+			resp, respCancel, err = e.openFullResponse(tctx, client, url, headers)
+			if err != nil {
+				return err
+			}
+			total = resp.ContentLength
+
 		}
 	} else { // 200 OK: the server ignored the open range
 		if resp.ContentLength > 0 {
@@ -931,7 +993,18 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 			if resp.Request != nil && resp.Request.URL != nil {
 				probeURL = resp.Request.URL.String()
 			}
-			ranged = confirmRangeSupport(tctx, client, probeURL, headers, total, resp.Header.Get("ETag"))
+			etag := resp.Header.Get("ETag")
+			resp.Body.Close()
+			respCancel()
+			ranged = confirmRangeSupport(tctx, client, probeURL, headers, total, etag)
+			resp, respCancel, err = e.openFullResponse(tctx, client, url, headers)
+			if err != nil {
+				return err
+			}
+			if resp.ContentLength != total || (etag != "" && resp.Header.Get("ETag") != etag) {
+				ranged = false
+				total = resp.ContentLength
+			}
 		}
 	}
 	if total <= 0 {
@@ -969,20 +1042,24 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 	t.Segments = plan.lanes
 	t.mu.Unlock()
 
-	t.setStatus(StatusDownloading, "")
+	if err := e.markDownloading(ctx, m); err != nil {
+		return err
+	}
 	e.emitManaged(m)
 
 	var progress int64
 	stop := make(chan struct{})
-	go e.reportProgress(t, &progress, stop)
-	go e.persistProgress(t, stop)
+	stopProgress := e.startProgress(t, w, &progress, stop)
 	opts := e.transferOptions(identity)
 
 	if !ranged {
-		err := e.streamNoRangeWithRetry(ctx, client, resp, respCancel, url, headers, plan.chunks[0], plan.lanes[0], w, &progress, opts, total)
+		err := e.streamNoRangeWithRetry(t, ctx, client, resp, respCancel, url, headers, plan.chunks[0], plan.lanes[0], w, &progress, opts, total)
 		close(stop)
+		stopProgress()
 		t.recalcDownloaded()
-		_ = writeMeta(t)
+		if checkpointErr := writeMeta(t); checkpointErr != nil {
+			return fmt.Errorf("%v; checkpoint: %w", err, checkpointErr)
+		}
 		return err
 	}
 
@@ -1018,9 +1095,12 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 
 	wg.Wait()
 	close(stop)
+	stopProgress()
 	close(errCh)
 	t.recalcDownloaded()
-	_ = writeMeta(t)
+	if err := writeMeta(t); err != nil {
+		return err
+	}
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1032,6 +1112,7 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 // a single connection, restarting from scratch (the only option) on transient
 // mid-stream failures instead of stranding the task.
 func (e *Engine) streamNoRangeWithRetry(
+	t *Task,
 	ctx context.Context,
 	client *http.Client,
 	first *http.Response,
@@ -1104,6 +1185,14 @@ func (e *Engine) streamNoRangeWithRetry(
 			if lane != nil {
 				lane.reset()
 			}
+			total = r2.ContentLength
+			t.mu.Lock()
+			chunk.End = total - 1
+			if lane != nil {
+				lane.End = chunk.End
+			}
+			t.TotalSize, t.ETag, t.LastModified = total, r2.Header.Get("ETag"), r2.Header.Get("Last-Modified")
+			t.mu.Unlock()
 			resp, cancel = r2, rcancel
 		}
 		sopts := opts
@@ -1114,7 +1203,19 @@ func (e *Engine) streamNoRangeWithRetry(
 		}()
 		resp, cancel = nil, nil
 		if err == nil {
+			t.mu.Lock()
+			if total < 0 {
+				t.TotalSize = chunk.loaded()
+				chunk.End = chunk.loaded() - 1
+				if lane != nil {
+					lane.End = chunk.End
+				}
+			}
+			t.mu.Unlock()
 			return nil
+		}
+		if isFatalDownloadError(err) {
+			return err
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -1131,7 +1232,7 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 	t.mu.RLock()
 	chunks := append([]*Chunk(nil), t.Chunks...)
 	lanes := append([]*Segment(nil), t.Segments...)
-	headers := t.headersCopy()
+	headers := cloneHeaders(t.Headers)
 	url := t.URL
 	identity := responseIdentity{ETag: t.ETag, LastModified: t.LastModified, FinalURL: t.FinalURL, TotalSize: t.TotalSize}
 	t.mu.RUnlock()
@@ -1147,8 +1248,7 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 
 	var progress int64
 	stop := make(chan struct{})
-	go e.reportProgress(t, &progress, stop)
-	go e.persistProgress(t, stop)
+	stopProgress := e.startProgress(t, w, &progress, stop)
 
 	tctx, tcancel := context.WithCancel(ctx)
 	defer tcancel()
@@ -1169,9 +1269,12 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 
 	wg.Wait()
 	close(stop)
+	stopProgress()
 	close(errCh)
 	t.recalcDownloaded()
-	_ = writeMeta(t)
+	if err := writeMeta(t); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1266,183 +1369,10 @@ func (e *Engine) persistProgress(t *Task, stop <-chan struct{}) {
 			return
 		case <-ticker.C:
 			if e.isActive(t.ID) {
-				_ = writeMeta(t)
-				e.cfg.OnPersist(t.Record())
+				e.persistTask(t)
 			}
 		}
 	}
-}
-
-// fastStart downloads a fresh task with no pre-flight probe: it opens a single
-// open-ended request (Range: bytes=0-) whose response headers reveal the size and
-// range support, and whose body is streamed straight to disk as segment 0. The
-// moment those headers arrive we know the total size, flip to Downloading and —
-// if the server supports ranges — fan out the remaining segments on their own
-// connections. This removes the dead round-trip that made downloads look stalled
-// for the first few seconds, so they start at full speed like IDM.
-func (e *Engine) fastStart(ctx context.Context, client *http.Client, t *Task, w *fileWriter, m *managed) error {
-	return e.fastStartV2(ctx, client, t, w, m)
-}
-
-func (e *Engine) fastStartLegacy(ctx context.Context, client *http.Client, t *Task, w *fileWriter, m *managed) error {
-	headers := t.headersCopy()
-	url := t.URL
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	applyHeaders(req, headers)
-	req.Header.Set("Range", "bytes=0-")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	// resp.Body is handed to the segment-0 streamer, which closes it.
-
-	if resp.StatusCode >= 400 {
-		resp.Body.Close()
-		return fmt.Errorf("server returned %s", resp.Status)
-	}
-
-	total := int64(-1)
-	ranged := false
-	if resp.StatusCode == http.StatusPartialContent {
-		ranged = true
-		if n := parseContentRangeTotal(resp.Header.Get("Content-Range")); n > 0 {
-			total = n
-		} else if resp.ContentLength > 0 {
-			total = resp.ContentLength
-		}
-	} else { // 200 OK: server ignored the range request
-		if strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes") {
-			ranged = true
-		}
-		if resp.ContentLength > 0 {
-			total = resp.ContentLength
-		}
-	}
-	// Without a known size we cannot split into ranges; stream on one connection.
-	if total <= 0 {
-		ranged = false
-	}
-
-	t.mu.Lock()
-	t.TotalSize = total
-	t.Resumable = ranged
-	if t.MIME == "" {
-		t.MIME = resp.Header.Get("Content-Type")
-	}
-	if t.Filename == "" {
-		t.Filename = resolveFilename(resp, url)
-	}
-	conns := t.Connections
-	if !ranged {
-		conns = 1
-	}
-	t.Segments = buildSegments(total, conns)
-	segs := t.Segments
-	t.mu.Unlock()
-
-	// Size is known now, so progress, ETA and per-thread bars come alive at once.
-	t.setStatus(StatusDownloading, "")
-	e.emitManaged(m)
-
-	var progress int64
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(segs))
-
-	// Segment 0 consumes the already-open response body — bytes are flowing from
-	// the first packet, with no extra handshake.
-	wg.Add(1)
-	go func(s *Segment) {
-		defer wg.Done()
-		if err := streamSegment(ctx, resp, s, w, ranged, &progress); err != nil {
-			errCh <- err
-		}
-	}(segs[0])
-
-	// Remaining segments open their own ranged connections in parallel.
-	for i := 1; i < len(segs); i++ {
-		wg.Add(1)
-		go func(s *Segment) {
-			defer wg.Done()
-			if err := downloadSegment(ctx, client, url, headers, s, w, ranged, &progress); err != nil {
-				errCh <- err
-			}
-		}(segs[i])
-	}
-
-	stop := make(chan struct{})
-	go e.reportProgress(t, &progress, stop)
-
-	wg.Wait()
-	close(stop)
-	close(errCh)
-
-	t.recalcDownloaded()
-	_ = writeMeta(t)
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// transfer runs the segment workers concurrently and reports progress until all
-// complete, the context is cancelled, or one fails.
-func (e *Engine) transfer(ctx context.Context, client *http.Client, t *Task, w *fileWriter) error {
-	return e.transferV2(ctx, client, t, w)
-}
-
-func (e *Engine) transferLegacy(ctx context.Context, client *http.Client, t *Task, w *fileWriter) error {
-	t.mu.RLock()
-	segs := t.Segments
-	ranged := t.Resumable
-	headers := t.headersCopy()
-	url := t.URL
-	t.mu.RUnlock()
-
-	var progress int64
-	atomic.StoreInt64(&progress, 0)
-
-	var wg sync.WaitGroup
-	errCh := make(chan error, len(segs))
-	for _, seg := range segs {
-		wg.Add(1)
-		go func(s *Segment) {
-			defer wg.Done()
-			if err := downloadSegment(ctx, client, url, headers, s, w, ranged, &progress); err != nil {
-				errCh <- err
-			}
-		}(seg)
-	}
-
-	stop := make(chan struct{})
-	go e.reportProgress(t, &progress, stop)
-
-	wg.Wait()
-	close(stop)
-	close(errCh)
-
-	t.recalcDownloaded()
-	_ = writeMeta(t)
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	for err := range errCh {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // reportProgress periodically computes speed and emits throttled updates. It
@@ -1460,7 +1390,7 @@ func (e *Engine) reportProgress(t *Task, progress *int64, stop <-chan struct{}) 
 
 	t.recalcDownloaded()
 	if e.isActive(t.ID) {
-		e.cfg.OnUpdate(t.Snapshot()) // immediate first paint
+		e.emitUpdate(t) // immediate first paint
 	}
 
 	for {
@@ -1482,14 +1412,18 @@ func (e *Engine) reportProgress(t *Task, progress *int64, stop <-chan struct{}) 
 			// true speed immediately instead of creeping up from zero; smooth
 			// thereafter.
 			if t.Speed == 0 {
-				t.Speed = int64(instant)
+				if t.Status == StatusDownloading {
+					t.Speed = int64(instant)
+				}
 			} else {
-				t.Speed = int64(alpha*instant + (1-alpha)*float64(t.Speed))
+				if t.Status == StatusDownloading {
+					t.Speed = int64(alpha*instant + (1-alpha)*float64(t.Speed))
+				}
 			}
 			t.mu.Unlock()
 			t.recalcDownloaded()
 			if e.isActive(t.ID) {
-				e.cfg.OnUpdate(t.Snapshot())
+				e.emitUpdate(t)
 			}
 		}
 	}
@@ -1511,26 +1445,29 @@ func (e *Engine) fail(t *Task, ctx context.Context, err error) {
 
 // emit pushes both a UI update and a durable persist for a task.
 func (e *Engine) emit(t *Task) {
-	e.cfg.OnUpdate(t.Snapshot())
-	e.cfg.OnPersist(t.Record())
-}
-
-func (e *Engine) emitManaged(m *managed) {
-	e.mu.Lock()
-	removed := m.removed
-	e.mu.Unlock()
-	if removed {
-		return
-	}
-	e.emit(m.task)
-}
-
-func (e *Engine) emitIfActive(t *Task) {
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
 	if !e.isActive(t.ID) {
 		return
 	}
-	e.emit(t)
+	e.cfg.OnPersist(t.DurableRecord())
+	e.emitUpdateLocked(t)
 }
+func (e *Engine) emitUpdateLocked(t *Task) {
+	t.mu.Lock()
+	t.Revision++
+	t.mu.Unlock()
+	e.cfg.OnUpdate(t.Snapshot())
+}
+func (e *Engine) emitUpdate(t *Task) {
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+	if e.isActive(t.ID) {
+		e.emitUpdateLocked(t)
+	}
+}
+func (e *Engine) emitManaged(m *managed) { e.emit(m.task) }
+func (e *Engine) emitIfActive(t *Task)   { e.emit(t) }
 
 func (e *Engine) isActive(id string) bool {
 	e.mu.Lock()
@@ -1550,4 +1487,56 @@ func (t *Task) headersCopy() map[string]string {
 		cp[k] = v
 	}
 	return cp
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	copy := make(map[string]string, len(headers))
+	for k, v := range headers {
+		copy[k] = v
+	}
+	return copy
+}
+func (e *Engine) markDownloading(ctx context.Context, m *managed) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.task.setStatus(StatusDownloading, "")
+	return nil
+}
+func (e *Engine) openFullResponse(ctx context.Context, client *http.Client, url string, headers map[string]string) (*http.Response, context.CancelFunc, error) {
+	rctx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	applyHeaders(req, headers)
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		cancel()
+		return nil, nil, fmt.Errorf("expected full response, got %s", resp.Status)
+	}
+	return resp, cancel, nil
+}
+
+func validChunkLayout(chunks []*Chunk, total, fileSize int64) bool {
+	next := int64(0)
+	for _, c := range chunks {
+		if c == nil || c.Start != next || c.End < c.Start || c.End >= total {
+			return false
+		}
+		n := c.loaded()
+		if n < 0 || n > c.size() || (n > 0 && c.Start+n > fileSize) {
+			return false
+		}
+		next = c.End + 1
+	}
+	return next == total
 }
