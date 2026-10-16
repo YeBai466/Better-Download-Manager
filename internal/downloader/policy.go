@@ -28,12 +28,13 @@ const (
 )
 
 type RuntimeConfig struct {
-	MaxConcurrent  int
-	MaxConnections int
-	SpeedLimit     int64
-	Retries        int
-	StallTimeout   time.Duration
-	MetaInterval   time.Duration
+	AdaptiveConnections bool
+	MaxConcurrent       int
+	MaxConnections      int
+	SpeedLimit          int64
+	Retries             int
+	StallTimeout        time.Duration
+	MetaInterval        time.Duration
 }
 
 func normalizeRuntimeConfig(c RuntimeConfig) RuntimeConfig {

@@ -117,6 +117,9 @@ func readMeta(savePath string) (*metaFile, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
+	if m.Version < 1 || m.Version > 2 {
+		return nil, fmt.Errorf("unsupported metadata version %d", m.Version)
+	}
 	return &m, nil
 }
 

@@ -2,11 +2,13 @@ package downloader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +39,80 @@ func TestUnknownContentRangeRequiresFullResponse(t *testing.T) {
 		t.Fatal(info.Error)
 	}
 	assertFileEquals(t, dst, data)
+}
+
+func TestRecoverRenameBeforeDatabaseCommit(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "committed.bin")
+	data := makeData(4096)
+	w, err := openPartFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.WriteAt(data, 0)
+	task := &Task{ID: "committed", URL: "https://example.invalid/file", SavePath: dst, TotalSize: int64(len(data)), Resumable: true, Status: StatusPaused,
+		Chunks: []*Chunk{{Index: 0, Start: 0, End: int64(len(data)) - 1, Downloaded: int64(len(data))}}}
+	if err := writeMeta(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(w, dst); err != nil {
+		t.Fatal(err)
+	}
+	updates := make(chan TaskInfo, 128)
+	e := newTestEngine(updates)
+	defer e.Shutdown()
+	e.Restore(TaskFromRecord(task.Record()))
+	if err := e.Start(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	info := waitForStatus(t, updates, StatusCompleted, StatusError)
+	if info.Status != StatusCompleted {
+		t.Fatal(info.Error)
+	}
+	assertFileEquals(t, dst, data)
+}
+
+func TestDeleteSerializesWithInflightPersistence(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	persisted := false
+	e := NewEngine(Config{Persist: func(r Record) error {
+		if r.Status == StatusConnecting {
+			close(entered)
+			<-release
+		}
+		mu.Lock()
+		persisted = true
+		mu.Unlock()
+		return nil
+	}, RemoveRecord: func(string) error { mu.Lock(); persisted = false; mu.Unlock(); return nil }})
+	_, err := e.Add(AddOptions{ID: "remove", URL: "https://example.invalid/file", SavePath: filepath.Join(t.TempDir(), "file"), AutoStart: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	removed := make(chan error, 1)
+	go func() { removed <- e.Remove("remove", true) }()
+	close(release)
+	if err := <-removed; err != nil {
+		t.Fatal(err)
+	}
+	e.Shutdown()
+	mu.Lock()
+	defer mu.Unlock()
+	if persisted {
+		t.Fatal("deleted task resurrected in persistence")
+	}
+}
+
+func TestFailedAdmissionDoesNotRegisterTask(t *testing.T) {
+	e := NewEngine(Config{Persist: func(Record) error { return errors.New("disk full") }})
+	defer e.Shutdown()
+	if _, err := e.Add(AddOptions{ID: "failed", SavePath: filepath.Join(t.TempDir(), "file")}); err == nil {
+		t.Fatal("admission acknowledged without durable record")
+	}
+	if len(e.List()) != 0 {
+		t.Fatal("failed task was registered")
+	}
 }
 
 func TestInitialStreamsRespectGlobalBudget(t *testing.T) {
@@ -187,4 +263,54 @@ func TestSpeedLimitChangeWakesWaiter(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("rate change did not wake waiter")
 	}
+}
+
+func TestSlowTailIsReassignedAfterWriterStops(t *testing.T) {
+	data := makeData(16 << 20)
+	var split atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, ok := parseRange(r.Header.Get("Range"), len(data))
+		if !ok {
+			start, end = 0, len(data)-1
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.Header().Set("ETag", `"stable"`)
+		w.WriteHeader(http.StatusPartialContent)
+		if start > 8<<20 {
+			split.Store(true)
+		}
+		for pos := start; pos <= end; {
+			n := min(64<<10, end-pos+1)
+			if _, err := w.Write(data[pos : pos+n]); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			pos += n
+			if start == 8<<20 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(40 * time.Millisecond):
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+	updates := make(chan TaskInfo, 256)
+	e := newTestEngineCfg(updates, func(c *Config) { c.AdaptiveConnections = true; c.MaxConnections = 2 })
+	defer e.Shutdown()
+	dst := filepath.Join(t.TempDir(), "tail.bin")
+	_, err := e.Add(AddOptions{ID: "tail", URL: srv.URL, SavePath: dst, Connections: 2, AutoStart: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := waitForStatus(t, updates, StatusCompleted, StatusError)
+	if info.Status != StatusCompleted {
+		t.Fatal(info.Error)
+	}
+	if !split.Load() {
+		t.Fatal("slow tail was not split")
+	}
+	assertFileEquals(t, dst, data)
 }

@@ -24,6 +24,9 @@ type transferPlan struct {
 }
 
 type transferOptions struct {
+	Batch        []*Chunk
+	Guard        *readGuard
+	Failures     *atomic.Int64
 	Retries      int
 	StallTimeout time.Duration
 	Limiter      *speedLimiter
@@ -210,10 +213,18 @@ type chunkQueue struct {
 	// file instead of all claiming from the front, so every connection — and
 	// every thread bar in the UI — is live from the first second.
 	regions [][2]int
+	cursors []int
+	scan    int
+	active  map[int][]*Chunk
 }
 
 func newChunkQueue(chunks []*Chunk, workers int, holdLowest bool) *chunkQueue {
-	return &chunkQueue{
+	regions := chunkRegions(len(chunks), workers)
+	cursors := make([]int, len(regions))
+	for i, r := range regions {
+		cursors[i] = r[0]
+	}
+	return &chunkQueue{cursors: cursors,
 		chunks:     chunks,
 		claimed:    make([]bool, len(chunks)),
 		holdLowest: holdLowest,
@@ -234,8 +245,9 @@ func (q *chunkQueue) nextChunk(worker int) *Chunk {
 		// No holdLowest guard needed here: only region 0 contains the reserved
 		// chunk, and its owner is the streamer itself, which reaches this path
 		// only after streaming ended (and cleared holdLowest).
-		lo, hi := q.regions[worker][0], q.regions[worker][1]
+		lo, hi := q.cursors[worker], q.regions[worker][1]
 		for i := lo; i < hi; i++ {
+			q.cursors[worker] = i + 1
 			if q.claimed[i] || q.chunks[i].Complete() {
 				continue
 			}
@@ -251,8 +263,12 @@ func (q *chunkQueue) nextChunk(worker int) *Chunk {
 // should steal it rather than idle while the streamer crawls.
 func (q *chunkQueue) stealLocked() *Chunk {
 	first := -1
-	for i, c := range q.chunks {
+	for i := q.scan; i < len(q.chunks); i++ {
+		c := q.chunks[i]
 		if q.claimed[i] || c.Complete() {
+			if first == -1 {
+				q.scan = i + 1
+			}
 			continue
 		}
 		if first == -1 {
@@ -389,6 +405,9 @@ func downloadChunkWithRetry(
 			return err
 		}
 		last = err
+		if opts.Failures != nil {
+			opts.Failures.Add(1)
+		}
 		if chunk.Current() > start {
 			// Forward progress was made: a connection that keeps delivering
 			// bytes must never exhaust the retry budget, no matter how often
@@ -559,6 +578,7 @@ func streamChunks(
 	streamOpts := opts
 	streamOpts.Cancel = respCancel
 	for {
+		q.setActive(0, []*Chunk{cur})
 		if err := copyBody(ctx, resp.Body, cur.Current(), cur, lane, w, progress, streamOpts, true); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -606,49 +626,18 @@ func copyBody(
 	buffer := transferBuffers.Get().(*[]byte)
 	defer transferBuffers.Put(buffer)
 	buf := (*buffer)[:copyBufferSize(opts.Limiter)]
-	stall := opts.StallTimeout
-	if stall <= 0 {
-		stall = defaultStallTimeout
+	guard := opts.Guard
+	if guard == nil {
+		guard = newReadGuard(opts.StallTimeout)
+		defer guard.Close()
 	}
-	var lastProgressUnix atomic.Int64
-	lastProgressUnix.Store(time.Now().UnixNano())
-	var stalled atomic.Bool
-	var reading atomic.Bool
-	if opts.Cancel != nil {
-		// Watchdog: body.Read can block forever on a server that sends
-		// headers then goes silent; the only way to unblock it is cancelling
-		// the request context. The in-loop check below only runs after a Read
-		// returns, so it can never catch this case on its own.
-		interval := stall / 2
-		if interval < 50*time.Millisecond {
-			interval = 50 * time.Millisecond
-		}
-		doneWatch := make(chan struct{})
-		go func() {
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-doneWatch:
-					return
-				case <-ticker.C:
-					last := time.Unix(0, lastProgressUnix.Load())
-					if reading.Load() && time.Since(last) > stall {
-						stalled.Store(true)
-						opts.Cancel()
-						return
-					}
-				}
-			}
-		}()
-		defer close(doneWatch)
-	}
+
 	for {
 		if capped && chunk.Complete() {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
-			if stalled.Load() {
+			if guard.stalled.Load() {
 				return errStalled
 			}
 			return err
@@ -662,12 +651,13 @@ func copyBody(
 				readBuf = readBuf[:rem]
 			}
 		}
-		lastProgressUnix.Store(time.Now().UnixNano())
-		reading.Store(true)
+		guard.Begin(opts.Cancel)
 		n, readErr := body.Read(readBuf)
-		reading.Store(false)
+		wasStalled := guard.End()
+		if wasStalled {
+			return errStalled
+		}
 		if n > 0 {
-			lastProgressUnix.Store(time.Now().UnixNano())
 			if opts.Limiter != nil {
 				if err := opts.Limiter.Wait(ctx, n); err != nil {
 					return err
@@ -675,10 +665,17 @@ func copyBody(
 				// Time spent sleeping in OUR rate limiter is not a server
 				// stall — re-stamp so a low speed limit can't make the
 				// watchdog kill a perfectly healthy throttled transfer.
-				lastProgressUnix.Store(time.Now().UnixNano())
 			}
 			if _, werr := w.WriteAt(readBuf[:n], offset); werr != nil {
 				return fatalError{werr}
+			}
+			if len(opts.Batch) > 0 {
+				for _, part := range opts.Batch {
+					lo, hi := max(offset, part.Start), min(offset+int64(n), part.End+1)
+					if hi > lo {
+						part.add(hi - lo)
+					}
+				}
 			}
 			offset += int64(n)
 			chunk.add(int64(n))
@@ -686,7 +683,6 @@ func copyBody(
 				lane.add(int64(n))
 			}
 			atomic.AddInt64(progress, int64(n))
-			lastProgressUnix.Store(time.Now().UnixNano())
 			if capped && chunk.Complete() {
 				return nil
 			}
@@ -698,7 +694,7 @@ func copyBody(
 			return nil
 		}
 		if readErr != nil {
-			if stalled.Load() {
+			if guard.stalled.Load() {
 				return errStalled
 			}
 			return readErr
@@ -821,6 +817,12 @@ func validatePartialResponse(resp *http.Response, start, end int64, id responseI
 	rs, re, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
 	if !ok {
 		return fatalError{err: fmt.Errorf("missing or invalid Content-Range")}
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != re-rs+1 {
+		return fatalError{fmt.Errorf("range length does not match Content-Length")}
+	}
+	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && !strings.EqualFold(encoding, "identity") {
+		return fatalError{fmt.Errorf("unexpected content encoding: %s", encoding)}
 	}
 	if rs != start {
 		// Bytes would land at the wrong offset — never write these.

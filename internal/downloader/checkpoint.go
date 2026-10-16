@@ -26,5 +26,10 @@ func (e *Engine) persistTask(t *Task) {
 		e.emitUpdateLocked(t)
 		return
 	}
-	e.cfg.OnPersist(t.DurableRecord())
+	if err := e.persistRecord(t.DurableRecord()); err != nil {
+		t.mu.Lock()
+		t.Error = fmt.Sprintf("save checkpoint: %v", err)
+		t.mu.Unlock()
+		e.emitUpdateLocked(t)
+	}
 }

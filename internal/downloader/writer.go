@@ -11,6 +11,7 @@ import (
 type fileWriter struct {
 	f        *os.File
 	partPath string
+	synced   bool
 }
 
 // openPartFile creates (or opens for resume) the .part file for a task.
@@ -54,7 +55,12 @@ func removeFinal(savePath string) {
 
 // The destination may have appeared after task admission. Never delete it.
 func finalize(w *fileWriter, savePath string) error {
-	if err := w.f.Sync(); err != nil {
+	if err := func() error {
+		if w.synced {
+			return nil
+		}
+		return w.f.Sync()
+	}(); err != nil {
 		w.f.Close()
 		return err
 	}

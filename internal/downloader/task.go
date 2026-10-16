@@ -147,6 +147,10 @@ type TaskInfo struct {
 func (t *Task) Snapshot() TaskInfo {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	return t.snapshotLocked()
+}
+
+func (t *Task) snapshotLocked() TaskInfo {
 
 	info := TaskInfo{
 		Revision:    t.Revision,
@@ -285,4 +289,11 @@ func (t *Task) resetTransferState() {
 	t.Segments = nil
 	t.Chunks = nil
 	t.mu.Unlock()
+}
+
+func (t *Task) snapshotForUpdate() TaskInfo {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Revision++
+	return t.snapshotLocked()
 }

@@ -22,16 +22,19 @@ const DefaultConnections = 8
 // Config configures an Engine. The callbacks let the host (Wails service) react
 // to task updates without the engine depending on the UI or storage layers.
 type Config struct {
-	MaxConcurrent  int                               // max simultaneously downloading tasks
-	MaxConnections int                               // max simultaneous HTTP transfers across all tasks
-	SpeedLimit     int64                             // global bytes/sec, 0 = unlimited
-	Retries        int                               // retries per ranged chunk
-	StallTimeout   time.Duration                     // no-progress timeout per response
-	MetaInterval   time.Duration                     // periodic resume-state flush interval
-	ClientFactory  func(proxy.Settings) *http.Client // builds the HTTP client (proxy-aware)
-	OnUpdate       func(info TaskInfo)               // throttled progress + status changes
-	OnPersist      func(rec Record)                  // durable state changes (status only)
-	OnRemoved      func(id string)                   // task removed
+	AdaptiveConnections bool
+	MaxConcurrent       int                               // max simultaneously downloading tasks
+	MaxConnections      int                               // max simultaneous HTTP transfers across all tasks
+	SpeedLimit          int64                             // global bytes/sec, 0 = unlimited
+	Retries             int                               // retries per ranged chunk
+	StallTimeout        time.Duration                     // no-progress timeout per response
+	MetaInterval        time.Duration                     // periodic resume-state flush interval
+	ClientFactory       func(proxy.Settings) *http.Client // builds the HTTP client (proxy-aware)
+	OnUpdate            func(info TaskInfo)               // throttled progress + status changes
+	Persist             func(Record) error
+	RemoveRecord        func(string) error
+	OnPersist           func(rec Record) // durable state changes (status only)
+	OnRemoved           func(id string)  // task removed
 }
 
 // Engine manages the task queue, scheduling and lifecycle of downloads.
@@ -111,6 +114,7 @@ func (e *Engine) UpdateRuntime(rt RuntimeConfig) {
 	e.cfg.Retries = rt.Retries
 	e.cfg.StallTimeout = rt.StallTimeout
 	e.cfg.MetaInterval = rt.MetaInterval
+	e.cfg.AdaptiveConnections = rt.AdaptiveConnections
 	e.connections.SetLimit(rt.MaxConnections)
 	e.mu.Unlock()
 	e.limiter.SetRate(rt.SpeedLimit)
@@ -172,7 +176,19 @@ func (e *Engine) Add(opts AddOptions) (TaskInfo, error) {
 	}
 	// Emit an update so any window (incl. the main list) shows the new task,
 	// then persist it. AutoStart tasks are then scheduled to run.
-	e.emit(t)
+	if err := e.emit(t); err != nil {
+		e.mu.Lock()
+		delete(e.tasks, t.ID)
+		for i, id := range e.order {
+			if id == t.ID {
+				e.order = append(e.order[:i], e.order[i+1:]...)
+				break
+			}
+		}
+		e.mu.Unlock()
+		e.cfg.OnRemoved(t.ID)
+		return TaskInfo{}, err
+	}
 	if opts.AutoStart {
 		e.schedule()
 	}
@@ -247,7 +263,12 @@ func (e *Engine) Pause(id string) error {
 	// Worker shutdown checkpoints the progress; UI feedback never waits for disk.
 	e.emitUpdate(m.task)
 	if !running {
-		e.emitManaged(m)
+		e.mu.Lock()
+		if !e.closed {
+			e.wg.Add(1)
+			go func() { defer e.wg.Done(); e.emitManaged(m) }()
+		}
+		e.mu.Unlock()
 	}
 	return nil
 }
@@ -268,6 +289,16 @@ func (e *Engine) Remove(id string, deleteFile bool) error {
 		e.mu.Unlock()
 		e.emitMu.Unlock()
 		return ErrNotFound
+	}
+	if e.cfg.RemoveRecord != nil {
+		e.mu.Unlock()
+		err := e.cfg.RemoveRecord(id)
+		e.mu.Lock()
+		if err != nil {
+			e.mu.Unlock()
+			e.emitMu.Unlock()
+			return err
+		}
 	}
 	m.removed = true
 	delete(e.tasks, id)
@@ -307,8 +338,10 @@ func (e *Engine) Remove(id string, deleteFile bool) error {
 func (e *Engine) PathOccupied(path string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.retired[path] {
-		return true
+	for retired := range e.retired {
+		if strings.EqualFold(retired, path) {
+			return true
+		}
 	}
 	for _, m := range e.tasks {
 		if strings.EqualFold(m.task.SavePath, path) {
@@ -344,6 +377,7 @@ func (e *Engine) Get(id string) (TaskInfo, error) {
 
 // Shutdown pauses all active tasks and prevents new ones from starting.
 func (e *Engine) Shutdown() {
+	e.emitMu.Lock()
 	e.mu.Lock()
 	e.closed = true
 	for _, m := range e.tasks {
@@ -355,10 +389,32 @@ func (e *Engine) Shutdown() {
 		}
 	}
 	e.mu.Unlock()
+	e.emitMu.Unlock()
 	e.wg.Wait()
 	// Serialize with the last callback before the owner closes its database.
 	e.emitMu.Lock()
 	e.emitMu.Unlock()
+}
+
+// PauseAllAndWait leaves the engine reusable after flushing every active run.
+func (e *Engine) PauseAllAndWait() {
+	e.mu.Lock()
+	var done []chan struct{}
+	for _, m := range e.tasks {
+		if m.task.getStatus() == StatusQueued || m.running {
+			m.task.setStatus(StatusPaused, "")
+			if m.cancel != nil {
+				m.cancel()
+			}
+			if m.running {
+				done = append(done, m.done)
+			}
+		}
+	}
+	e.mu.Unlock()
+	for _, ch := range done {
+		<-ch
+	}
 }
 
 // schedule launches queued tasks until the concurrency limit is reached.
@@ -442,6 +498,9 @@ func (e *Engine) run(ctx context.Context, m *managed, done chan struct{}) {
 
 // runOnce performs a single resume-or-fresh transfer attempt to completion.
 func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *managed) error {
+	if recoverFinalized(t) {
+		return nil
+	}
 	// Resume path: a task we already know the layout of (paused→resumed in the
 	// same session, restored from the DB, or with a sidecar .bdmeta) skips
 	// probing and just refetches the remaining ranges. Fresh tasks take the
@@ -496,6 +555,7 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 		if checkpointErr := writeMeta(t); checkpointErr != nil {
 			return fmt.Errorf("%v; checkpoint: %w", err, checkpointErr)
 		}
+		w.synced = err == nil
 		return err
 	}
 	return finalize(w, t.SavePath)
@@ -859,7 +919,6 @@ func (e *Engine) openInitialResponse(ctx context.Context, client *http.Client, u
 			case isTransientStatus(resp.StatusCode):
 				last = fmt.Errorf("server returned %s", resp.Status)
 				retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
 				rcancel()
 				if attempt < retries {
@@ -972,6 +1031,9 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 			return fmt.Errorf("server answered bytes=0- with range starting at %d", rs)
 		}
 		if n > 0 {
+			if err := validatePartialResponse(resp, 0, n-1, responseIdentity{TotalSize: n}); err != nil {
+				return err
+			}
 			total = n
 			ranged = true
 		} else {
@@ -1016,6 +1078,9 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 		plan = buildTransferPlan(total, t.Connections)
 	} else {
 		plan = transferPlan{workers: 1, chunks: []*Chunk{{Index: 0, Start: 0, End: total - 1}}, lanes: buildWorkerLanes(total, 1)}
+	}
+	if ranged && e.adaptiveEnabled() && total >= smallFileThreshold {
+		plan.lanes = buildWorkerLanes(total, min(t.Connections, 32))
 	}
 	identity := responseIdentity{
 		ETag:         resp.Header.Get("ETag"),
@@ -1065,47 +1130,23 @@ func (e *Engine) fastStartV2(ctx context.Context, client *http.Client, t *Task, 
 
 	holder := newURLHolder(identity.FinalURL, url, headers)
 	q := newChunkQueue(plan.chunks, plan.workers, true)
-	errCh := make(chan error, plan.workers+1)
-	var wg sync.WaitGroup
+	err = e.runWorkers(tctx, client, holder, headers, q, plan.lanes, t, w, &progress, opts, plan.workers,
+		func(workerCtx context.Context, local transferOptions) error {
+			return streamChunks(workerCtx, resp, respCancel, client, holder, headers, q, plan.lanes[0], w, &progress, local)
+		}, respCancel)
 
-	// The fast-start connection already has the whole file streaming on it —
-	// keep it: worker 0 extends it through the contiguous chunks of its own
-	// region, then joins the others in the steal pool. The remaining workers
-	// each open a ranged connection at the head of their own region, so all
-	// connections are live and spread across the file from the first second.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := streamChunks(tctx, resp, respCancel, client, holder, headers, q, plan.lanes[0], w, &progress, opts); err != nil {
-			errCh <- err
-			tcancel()
-			return
-		}
-		e.consumeChunks(tctx, client, holder, headers, q, 0, plan.lanes[0], w, &progress, opts, errCh, tcancel)
-	}()
-
-	for i := 1; i < plan.workers; i++ {
-		worker, lane := i, plan.lanes[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			e.consumeChunks(tctx, client, holder, headers, q, worker, lane, w, &progress, opts, errCh, tcancel)
-		}()
-	}
-
-	wg.Wait()
 	close(stop)
 	stopProgress()
-	close(errCh)
 	t.recalcDownloaded()
 	if err := writeMeta(t); err != nil {
 		return err
 	}
+	w.synced = true
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return pickTransferError(ctx, errCh)
+	return err
 }
 
 // streamNoRangeWithRetry downloads a file that cannot be split into ranges on
@@ -1159,7 +1200,6 @@ func (e *Engine) streamNoRangeWithRetry(
 			if r2.StatusCode != http.StatusOK {
 				status := r2.Status
 				transient := isTransientStatus(r2.StatusCode)
-				_, _ = io.Copy(io.Discard, io.LimitReader(r2.Body, 4096))
 				r2.Body.Close()
 				rcancel()
 				if !transient {
@@ -1255,90 +1295,20 @@ func (e *Engine) transferV2(ctx context.Context, client *http.Client, t *Task, w
 	holder := newURLHolder(identity.FinalURL, url, headers)
 	workers := len(lanes)
 	q := newChunkQueue(chunks, workers, false)
-	errCh := make(chan error, workers)
 	opts := e.transferOptions(identity)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		worker, lane := i, lanes[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			e.consumeChunks(tctx, client, holder, headers, q, worker, lane, w, &progress, opts, errCh, tcancel)
-		}()
-	}
+	err := e.runWorkers(tctx, client, holder, headers, q, lanes, t, w, &progress, opts, min(workers, smartConnections(identity.TotalSize, t.Connections)), nil, nil)
 
-	wg.Wait()
 	close(stop)
 	stopProgress()
-	close(errCh)
 	t.recalcDownloaded()
 	if err := writeMeta(t); err != nil {
 		return err
 	}
+	w.synced = true
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return pickTransferError(ctx, errCh)
-}
-
-func (e *Engine) consumeChunks(
-	ctx context.Context,
-	client *http.Client,
-	holder *urlHolder,
-	headers map[string]string,
-	q *chunkQueue,
-	worker int,
-	lane *Segment,
-	w *fileWriter,
-	progress *int64,
-	opts transferOptions,
-	errCh chan<- error,
-	cancel context.CancelFunc,
-) {
-	for {
-		c := q.nextChunk(worker)
-		if c == nil {
-			return
-		}
-		if err := downloadChunkWithRetry(ctx, client, holder, headers, c, lane, w, progress, opts); err != nil {
-			errCh <- err
-			// The task is going to fail; stop the siblings from spending time
-			// and bandwidth on data that would be thrown away.
-			if cancel != nil {
-				cancel()
-			}
-			return
-		}
-	}
-}
-
-// pickTransferError chooses the most meaningful error out of what the workers
-// reported: an identity change beats everything (it triggers the transparent
-// restart), and a real failure beats the context.Canceled noise the sibling
-// cancellation produces.
-func pickTransferError(taskCtx context.Context, errCh <-chan error) error {
-	var real, fallback error
-	for err := range errCh {
-		if err == nil {
-			continue
-		}
-		if isIdentityChanged(err) {
-			return err
-		}
-		if errors.Is(err, context.Canceled) && taskCtx.Err() == nil {
-			if fallback == nil {
-				fallback = err
-			}
-			continue
-		}
-		if real == nil {
-			real = err
-		}
-	}
-	if real != nil {
-		return real
-	}
-	return fallback
+	return err
 }
 
 func (e *Engine) transferOptions(id responseIdentity) transferOptions {
@@ -1349,6 +1319,7 @@ func (e *Engine) transferOptions(id responseIdentity) transferOptions {
 		Limiter:      e.limiter,
 		Connections:  e.connections,
 		Identity:     id,
+		Failures:     &atomic.Int64{},
 	}
 	e.mu.Unlock()
 	return opts
@@ -1444,30 +1415,29 @@ func (e *Engine) fail(t *Task, ctx context.Context, err error) {
 }
 
 // emit pushes both a UI update and a durable persist for a task.
-func (e *Engine) emit(t *Task) {
+func (e *Engine) emit(t *Task) error {
 	e.emitMu.Lock()
 	defer e.emitMu.Unlock()
 	if !e.isActive(t.ID) {
-		return
+		return nil
 	}
-	e.cfg.OnPersist(t.DurableRecord())
+	err := e.persistRecord(t.DurableRecord())
+	if err != nil {
+		t.mu.Lock()
+		t.Error = fmt.Sprintf("save task: %v", err)
+		t.mu.Unlock()
+	}
 	e.emitUpdateLocked(t)
+	return err
 }
-func (e *Engine) emitUpdateLocked(t *Task) {
-	t.mu.Lock()
-	t.Revision++
-	t.mu.Unlock()
-	e.cfg.OnUpdate(t.Snapshot())
-}
+func (e *Engine) emitUpdateLocked(t *Task) { e.cfg.OnUpdate(t.snapshotForUpdate()) }
 func (e *Engine) emitUpdate(t *Task) {
-	e.emitMu.Lock()
-	defer e.emitMu.Unlock()
 	if e.isActive(t.ID) {
-		e.emitUpdateLocked(t)
+		e.cfg.OnUpdate(t.snapshotForUpdate())
 	}
 }
-func (e *Engine) emitManaged(m *managed) { e.emit(m.task) }
-func (e *Engine) emitIfActive(t *Task)   { e.emit(t) }
+func (e *Engine) emitManaged(m *managed) { _ = e.emit(m.task) }
+func (e *Engine) emitIfActive(t *Task)   { _ = e.emit(t) }
 
 func (e *Engine) isActive(id string) bool {
 	e.mu.Lock()
@@ -1539,4 +1509,12 @@ func validChunkLayout(chunks []*Chunk, total, fileSize int64) bool {
 		next = c.End + 1
 	}
 	return next == total
+}
+
+func (e *Engine) persistRecord(r Record) error {
+	if e.cfg.Persist != nil {
+		return e.cfg.Persist(r)
+	}
+	e.cfg.OnPersist(r)
+	return nil
 }
