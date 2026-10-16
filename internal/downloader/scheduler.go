@@ -328,49 +328,69 @@ type readGuard struct {
 	started time.Time
 	cancel  context.CancelFunc
 	stalled atomic.Bool
-	done    chan struct{}
+	timer   *time.Timer
+	stall   time.Duration
+	closed  bool
+	expired bool
 }
 
 func newReadGuard(stall time.Duration) *readGuard {
 	if stall <= 0 {
 		stall = defaultStallTimeout
 	}
-	g := &readGuard{done: make(chan struct{})}
-	go func() {
-		ticker := time.NewTicker(max(stall/2, 10*time.Millisecond))
-		defer ticker.Stop()
-		for {
-			select {
-			case <-g.done:
-				return
-			case <-ticker.C:
-				g.mu.Lock()
-				if g.reading && time.Since(g.started) > stall && g.cancel != nil {
-					g.stalled.Store(true)
-					g.cancel()
-					g.reading = false
-				}
-				g.mu.Unlock()
-			}
-		}
-	}()
+	g := &readGuard{stall: stall}
+	g.mu.Lock()
+	g.timer = time.AfterFunc(stall, g.expire)
+	g.mu.Unlock()
 	return g
+}
+func (g *readGuard) expire() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return
+	}
+	if !g.reading {
+		g.timer.Reset(g.stall)
+		return
+	}
+	// A callback already queued before Reset must not cancel a later read.
+	if left := g.stall - time.Since(g.started); left > 0 {
+		g.timer.Reset(left)
+		return
+	}
+	if g.cancel != nil {
+		g.stalled.Store(true)
+		g.cancel()
+	}
+	g.reading = false
+	g.expired = true
 }
 func (g *readGuard) Begin(cancel context.CancelFunc) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.started = time.Now()
 	g.cancel = cancel
 	g.reading = true
 	g.stalled.Store(false)
-	g.mu.Unlock()
+	if g.expired {
+		g.expired = false
+		g.timer.Reset(g.stall)
+	}
 }
 func (g *readGuard) End() bool {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.reading = false
-	g.mu.Unlock()
 	return g.stalled.Load()
 }
-func (g *readGuard) Close() { close(g.done) }
+func (g *readGuard) Close() {
+	g.mu.Lock()
+	g.closed = true
+	g.reading = false
+	g.timer.Stop()
+	g.mu.Unlock()
+}
 
 func (q *chunkQueue) tailCandidate(worker int) bool {
 	q.mu.Lock()

@@ -131,6 +131,50 @@ func TestRecoverRenameBeforeDatabaseCommit(t *testing.T) {
 	assertFileEquals(t, dst, data)
 }
 
+func TestCommitReceiptSurvivesDatabaseFailure(t *testing.T) {
+	data := makeData(8192)
+	srv := rangeServer(t, data, true, 0)
+	defer srv.Close()
+	updates := make(chan TaskInfo, 128)
+	var stored Record
+	e := NewEngine(Config{Persist: func(r Record) error {
+		if r.Status == StatusCompleted {
+			return errors.New("database unavailable")
+		}
+		stored = r
+		return nil
+	}, OnUpdate: func(info TaskInfo) {
+		select {
+		case updates <- info:
+		default:
+		}
+	}})
+	dst := filepath.Join(t.TempDir(), "receipt.bin")
+	_, err := e.Add(AddOptions{ID: "receipt", URL: srv.URL, SavePath: dst, AutoStart: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := waitForStatus(t, updates, StatusCompleted, StatusError)
+	e.Shutdown()
+	if info.Status != StatusCompleted {
+		t.Fatal(info.Error)
+	}
+	if _, err := os.Stat(metaPath(dst)); err != nil {
+		t.Fatalf("commit receipt removed before database acknowledged: %v", err)
+	}
+	restoredUpdates := make(chan TaskInfo, 128)
+	restored := newTestEngine(restoredUpdates)
+	defer restored.Shutdown()
+	restored.Restore(TaskFromRecord(stored))
+	if err := restored.Start("receipt"); err != nil {
+		t.Fatal(err)
+	}
+	if final := waitForStatus(t, restoredUpdates, StatusCompleted, StatusError); final.Status != StatusCompleted {
+		t.Fatal(final.Error)
+	}
+	assertFileEquals(t, dst, data)
+}
+
 func TestDeleteSerializesWithInflightPersistence(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var mu sync.Mutex

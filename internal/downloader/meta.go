@@ -3,8 +3,10 @@ package downloader
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -47,17 +49,22 @@ func writeMeta(t *Task) error {
 	r := t.Record()
 	r.CheckpointSeq++
 	// Snapshot first, then flush: metadata must never claim bytes newer than Sync.
-	f, err := os.OpenFile(partPath(r.SavePath), os.O_RDWR, 0)
+	var err error
+	if t.writer != nil {
+		err = t.writer.Sync()
+	} else {
+		// Standalone sidecar callers (including recovery tools) may not own a writer.
+		f, openErr := os.OpenFile(partPath(r.SavePath), os.O_RDWR, 0)
+		if openErr != nil {
+			return openErr
+		}
+		err = f.Sync()
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}
 	if err != nil {
 		return err
-	}
-	err = f.Sync()
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
 	}
 	m := metaFile{Version: 2, CheckpointSeq: r.CheckpointSeq, URL: r.URL, FinalURL: r.FinalURL,
 		TotalSize: r.TotalSize, Resumable: r.Resumable, Filename: r.Filename, MIME: r.MIME,
@@ -67,15 +74,15 @@ func writeMeta(t *Task) error {
 		return err
 	}
 	path := metaPath(r.SavePath)
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".bdmeta-*.tmp")
+	name := filepath.Join(filepath.Dir(path), ".bdmeta-"+strconv.FormatUint(rand.Uint64(), 36)+".tmp")
+	tmp, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_SYNC, 0600)
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
 	defer os.Remove(name)
-	if _, err = tmp.Write(data); err == nil {
-		err = tmp.Sync()
-	}
+	// O_SYNC maps to FILE_FLAG_WRITE_THROUGH on Windows. The single metadata
+	// write is durable on return without a second FlushFileBuffers round trip.
+	_, err = tmp.Write(data)
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}

@@ -4,12 +4,11 @@ import "os"
 
 // Rename can finish just before a crash interrupts the database update. A
 // flushed complete sidecar plus the final file is the commit receipt.
-func recoverFinalized(t *Task) bool {
-	if _, err := os.Stat(partPath(t.SavePath)); !os.IsNotExist(err) {
+func recoverFinalized(t *Task, m *metaFile) bool {
+	if m == nil || m.URL != t.URL || m.TotalSize < 0 {
 		return false
 	}
-	m, err := readMeta(t.SavePath)
-	if err != nil || m.URL != t.URL || m.TotalSize < 0 {
+	if _, err := os.Stat(partPath(t.SavePath)); !os.IsNotExist(err) {
 		return false
 	}
 	f, err := os.Stat(t.SavePath)

@@ -481,10 +481,12 @@ func (e *Engine) run(ctx context.Context, m *managed, done chan struct{}) {
 	for attempt := 0; ; attempt++ {
 		err := e.runOnce(ctx, client, t, m)
 		if err == nil {
-			removeMeta(t.SavePath)
 			t.recalcDownloaded()
 			t.setStatus(StatusCompleted, "")
-			e.emitManaged(m)
+			// Retain the commit receipt until the database acknowledges completion.
+			if err := e.emit(t); err == nil {
+				removeMeta(t.SavePath)
+			}
 			return
 		}
 		if isIdentityChanged(err) && ctx.Err() == nil && attempt == 0 {
@@ -498,7 +500,8 @@ func (e *Engine) run(ctx context.Context, m *managed, done chan struct{}) {
 
 // runOnce performs a single resume-or-fresh transfer attempt to completion.
 func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *managed) error {
-	if recoverFinalized(t) {
+	meta, _ := readMeta(t.SavePath)
+	if recoverFinalized(t, meta) {
 		return nil
 	}
 	// Resume path: a task we already know the layout of (paused→resumed in the
@@ -507,7 +510,7 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 	// fast-start path, which starts streaming bytes on the very first
 	// connection. A network-level validation failure aborts WITHOUT resetting:
 	// a blip at resume time must not cost the user their partial data.
-	resumable, rerr := e.loadResume(ctx, client, t)
+	resumable, rerr := e.loadResume(ctx, client, t, meta)
 	if rerr != nil {
 		return rerr
 	}
@@ -516,6 +519,11 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 	if err != nil {
 		return err
 	}
+	t.metaMu.Lock()
+	t.writer = w
+	t.metaMu.Unlock()
+	defer func() { t.metaMu.Lock(); t.writer = nil; t.metaMu.Unlock(); w.Close() }()
+
 	if !resumable {
 		// Fresh start over a possibly stale .part (earlier failed attempt,
 		// leftover from a deleted DB row): clear it, or a smaller new file
@@ -539,7 +547,6 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 		xferErr = e.fastStartV2(ctx, client, t, w, m)
 	}
 	if xferErr != nil {
-		w.Close()
 		if err := writeMeta(t); err != nil {
 			return fmt.Errorf("%v; checkpoint: %w", xferErr, err)
 		}
@@ -551,7 +558,6 @@ func (e *Engine) runOnce(ctx context.Context, client *http.Client, t *Task, m *m
 	// "completed" file is the worst failure this engine can produce, and the
 	// check costs one in-memory pass plus a Stat.
 	if err := verifyComplete(t); err != nil {
-		w.Close()
 		if checkpointErr := writeMeta(t); checkpointErr != nil {
 			return fmt.Errorf("%v; checkpoint: %w", err, checkpointErr)
 		}
@@ -598,14 +604,14 @@ func verifyComplete(t *Task) error {
 // A non-nil error means validation could not be performed (network failure) —
 // the caller must abort without touching the partial data, so the user can
 // simply retry once the connection is back.
-func (e *Engine) loadResume(ctx context.Context, client *http.Client, t *Task) (bool, error) {
+func (e *Engine) loadResume(ctx context.Context, client *http.Client, t *Task, meta *metaFile) (bool, error) {
 	t.mu.RLock()
 	hasChunks := len(t.Chunks) > 0
 	hasSegments := len(t.Segments) > 0
 	ranged := t.Resumable
 	t.mu.RUnlock()
 
-	if meta, err := readMeta(t.SavePath); err == nil {
+	if meta != nil {
 		t.mu.RLock()
 		seq := t.CheckpointSeq
 		t.mu.RUnlock()
@@ -639,8 +645,8 @@ func (e *Engine) loadResume(ctx context.Context, client *http.Client, t *Task) (
 		}
 	}
 
-	if m, err := readMeta(t.SavePath); err == nil && m.TotalSize > 0 {
-		ok, verr := e.applyMetaIfSafe(ctx, client, t, m)
+	if meta != nil && meta.TotalSize > 0 {
+		ok, verr := e.applyMetaIfSafe(ctx, client, t, meta)
 		if verr != nil {
 			return false, verr
 		}
@@ -1325,23 +1331,24 @@ func (e *Engine) transferOptions(id responseIdentity) transferOptions {
 	return opts
 }
 
-func (e *Engine) persistProgress(t *Task, stop <-chan struct{}) {
+func (e *Engine) persistProgress(t *Task, stop <-chan struct{}, started time.Time) {
 	e.mu.Lock()
 	interval := e.cfg.MetaInterval
 	e.mu.Unlock()
 	if interval <= 0 {
 		interval = defaultMetaInterval
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(max(time.Millisecond, interval-time.Since(started)))
+	defer timer.Stop()
 	for {
 		select {
 		case <-stop:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			if e.isActive(t.ID) {
 				e.persistTask(t)
 			}
+			timer.Reset(interval)
 		}
 	}
 }
@@ -1349,12 +1356,17 @@ func (e *Engine) persistProgress(t *Task, stop <-chan struct{}) {
 // reportProgress periodically computes speed and emits throttled updates. It
 // emits one update immediately so the UI (total bar, per-thread bars and speed)
 // comes alive the instant the transfer starts instead of after the first tick.
-func (e *Engine) reportProgress(t *Task, progress *int64, stop <-chan struct{}) {
+func (e *Engine) reportProgress(t *Task, progress *int64, stop <-chan struct{}, started time.Time) {
 	const interval = 250 * time.Millisecond
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	var lastBytes int64
+	lastBytes := atomic.LoadInt64(progress)
 	lastTime := time.Now()
+	t.mu.Lock()
+	if t.Status == StatusDownloading && lastTime.After(started) {
+		t.Speed = int64(float64(lastBytes) / lastTime.Sub(started).Seconds())
+	}
+	t.mu.Unlock()
 	// A lighter EMA (higher alpha) so the displayed speed converges to the real
 	// rate in ~1s instead of feeling like it slowly creeps up over many seconds.
 	const alpha = 0.6

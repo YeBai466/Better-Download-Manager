@@ -94,6 +94,7 @@ type Task struct {
 	// shared temp file.
 	metaMu     sync.Mutex
 	checkpoint *Record
+	writer     *fileWriter // guarded by metaMu; reuses the active data handle for Sync
 
 	ID           string
 	URL          string
