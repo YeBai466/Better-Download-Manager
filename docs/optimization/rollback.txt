@@ -41,3 +41,5 @@ MODIFIED COMMAND: go test ./internal/downloader -run TestUnknownContentRangeRequ
 PASS
 ok  	github.com/yebai/better-download-manager/internal/downloader	0.526s
 MODIFIED exit=0
+PATCH COMMAND: git apply --check --index D:/APPs/B_Download_Manager/bin/download-optimization.patch
+PATCH exit=0
