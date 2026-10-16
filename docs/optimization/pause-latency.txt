@@ -1,0 +1,17 @@
+=== RUN   TestPauseLatencyP95
+    regression_test.go:80: 20 active HTTP transfers: pause P95=0s
+--- PASS: TestPauseLatencyP95 (0.16s)
+=== RUN   TestPauseLatencyP95
+    regression_test.go:80: 20 active HTTP transfers: pause P95=0s
+--- PASS: TestPauseLatencyP95 (0.14s)
+=== RUN   TestPauseLatencyP95
+    regression_test.go:80: 20 active HTTP transfers: pause P95=0s
+--- PASS: TestPauseLatencyP95 (0.12s)
+=== RUN   TestPauseLatencyP95
+    regression_test.go:80: 20 active HTTP transfers: pause P95=0s
+--- PASS: TestPauseLatencyP95 (0.12s)
+=== RUN   TestPauseLatencyP95
+    regression_test.go:80: 20 active HTTP transfers: pause P95=0s
+--- PASS: TestPauseLatencyP95 (0.12s)
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	6.229s

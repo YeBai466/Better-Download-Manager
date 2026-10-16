@@ -44,7 +44,7 @@ Better Download Manager 使用 **Go + React（Wails v3）** 构建，复用系�
 
 | | 功能 | 说明 |
 |---|---|---|
-| 🚀 | **多线程分段下载** | 基于 HTTP Range，默认 8 连接并行 |
+| 🚀 | **多线程分段下载** | 基于 HTTP Range，默认每任务最多 8 连接，支持自适应调度 |
 | ⏸ | **断点续传** | 崩溃安全的 `.bdmeta` sidecar + SQLite 持久化 |
 | 🌐 | **浏览器接管** | Chrome / Edge / Firefox 扩展拦截下载并转交本程序 |
 | 🛡 | **代理支持** | 系统代理 / 自定义 HTTP(S) / SOCKS5 |
@@ -61,7 +61,7 @@ Better Download Manager 使用 **Go + React（Wails v3）** 构建，复用系�
 
 ## 浏览器扩展
 
-应用运行时会在 `127.0.0.1:9614` 启动接管服务（端口与开关可在「选项 → 浏览器接管」中调整）。扩展会取消浏览器自带下载并转交本程序——按设置弹出添加对话框或直接开始；**若程序未运行，扩展自动回退为浏览器原生下载。**
+应用运行时会在 `127.0.0.1:9614` 启动接管服务（端口与开关可在「选项 → 浏览器接管」中调整）。扩展会先暂停浏览器下载，待本程序持久化确认后再取消原任务；按设置弹出添加对话框或直接开始。**程序未运行时原下载继续；接管确认中断时保留原条目并自动查询结果。**
 
 #### Chrome / Edge
 
@@ -158,7 +158,7 @@ Better Download Manager is built with **Go + React (Wails v3)** and reuses the s
 
 **Install** — download the latest `*-installer.exe` from [Releases](https://github.com/YeBai466/Better-Download-Manager/releases). To update, just run the new installer over the top; your download history and settings live in `%AppData%\BetterDownloadManager` and survive updates and uninstalls.
 
-**Browser extension** — the app runs a takeover service on `127.0.0.1:9614` (configurable under Options → Browser Integration). The extension is on the [Chrome Web Store](https://chromewebstore.google.com/detail/hgkakilajhnbpmhmpcnblioiiaomdkjp): install it silently with one click from Options, or add it manually from the store page. If the app isn't running, the extension falls back to the browser's native download. For Firefox, load `extensions/firefox/manifest.json` via `about:debugging`.
+**Browser extension** — the app runs a takeover service on `127.0.0.1:9614` (configurable under Options → Browser Integration). The extension is on the [Chrome Web Store](https://chromewebstore.google.com/detail/hgkakilajhnbpmhmpcnblioiiaomdkjp): install it silently with one click from Options, or add it manually from the store page. The extension pauses the original download and cancels it only after durable acknowledgement. If the app is absent, the original download keeps running. Lost acknowledgements are reconciled by request ID. For Firefox, load `extensions/firefox/manifest.json` via `about:debugging`.
 
 **Build**
 
@@ -180,3 +180,20 @@ Requirements: Go 1.25+, Node.js 20+, Windows 10/11 with the WebView2 runtime, an
 <div align="center">
 <sub>Built with Go · Wails v3 · React — for Windows.</sub>
 </div>
+
+## 可靠性与性能验证
+
+默认保持 5 个并发任务、每任务最多 8 连接；可在连接设置中关闭自适应连接。首条流、分块、续传验证与链接刷新共用连接预算，热修改设置保留正在使用的额度与连接池。
+
+```powershell
+go test -race ./internal/...
+go vet ./internal/...
+go test ./internal/downloader -run '^$' -bench 'BenchmarkTransferMatrix|BenchmarkMixedQueue' -benchmem -benchtime=1x -count=5
+cd frontend
+npm test
+# 浏览器回归夹具（独立模拟后端，不访问真实下载数据）
+npm run dev -- --config tests/ui/vite.config.ts --host 127.0.0.1 --port 5176
+# /tests/ui/index.html：一万条任务；/tests/ui/add.html：探测乱序与快速完成
+```
+
+[本次问题清单与测量结果](docs/optimization/REPORT.md)。

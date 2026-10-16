@@ -1,0 +1,11 @@
+=== RUN   TestCopyBodyCoalescesNetworkFragments
+    regression_test.go:72: 1 MiB / 1 KiB fragments: 5 positioned writes instead of 1024
+--- PASS: TestCopyBodyCoalescesNetworkFragments (0.00s)
+=== RUN   TestPauseLatencyP95
+    regression_test.go:131: 20 active HTTP transfers: pause P95=0s
+--- PASS: TestPauseLatencyP95 (0.37s)
+=== RUN   TestGlobalSpeedLimitAccuracy
+    regression_test.go:474: global rate=256.23 KiB/s, target=256 KiB/s, ratio=1.0009
+--- PASS: TestGlobalSpeedLimitAccuracy (4.01s)
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	10.316s

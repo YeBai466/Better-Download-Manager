@@ -1,0 +1,24 @@
+Wails v3.0.0-alpha2.104 › Build
+"uname": executable file not found in $PATH
+"uname": executable file not found in $PATH
+task: [windows:common:go:mod:tidy] go mod tidy
+task: Task "windows:common:generate:icons" is up to date
+task: [windows:common:install:frontend:deps:npm] npm install
+task: [windows:common:generate:bindings] wails3 generate bindings -f '-tags production -trimpath -buildvcs=false -ldflags="-w -s -H windowsgui"' -clean=true -ts -i
+Wails v3.0.0-alpha2.104 › Generate Bindings
+
+up to date, audited 30 packages in 3s
+
+8 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+ INFO  Processed: 274 Packages, 1 Service, 31 Methods, 3 Enums, 12 Models, 4 Events in 9.5562566s.
+ INFO  Output directory: D:\APPs\B_Download_Manager\frontend\bindings
+task: Task "build:frontend (DEV= RUNNER=npm)" is up to date
+task: [windows:generate:syso] wails3 generate syso -arch amd64 -icon windows/icon.ico -manifest windows/wails.exe.manifest -info windows/info.json -out ../wails_windows_amd64.syso
+task: [windows:build:native] go build -tags production -trimpath -buildvcs=false -ldflags="-w -s -H windowsgui" -o "bin/better-download-manager.exe"
+task: [windows:build:native] powershell Remove-item *.syso
+
+Need documentation? Run: ]8;;https://v3.wails.io/getting-started/your-first-app/\wails3 docs]8;;\
+ ♥   If Wails is useful to you or your company, please consider sponsoring the project: ]8;;https://github.com/sponsors/leaanthony\wails3 sponsor]8;;\

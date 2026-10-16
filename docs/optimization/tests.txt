@@ -1,0 +1,10 @@
+?   	github.com/yebai/better-download-manager/internal/category	[no test files]
+ok  	github.com/yebai/better-download-manager/internal/config	1.234s
+ok  	github.com/yebai/better-download-manager/internal/downloader	31.323s
+?   	github.com/yebai/better-download-manager/internal/httpclient	[no test files]
+ok  	github.com/yebai/better-download-manager/internal/policy	1.200s
+ok  	github.com/yebai/better-download-manager/internal/proxy	1.475s
+ok  	github.com/yebai/better-download-manager/internal/service	10.374s
+ok  	github.com/yebai/better-download-manager/internal/store	7.092s
+ok  	github.com/yebai/better-download-manager/internal/takeover	7.016s
+ok  	github.com/yebai/better-download-manager/internal/updates	7.030s

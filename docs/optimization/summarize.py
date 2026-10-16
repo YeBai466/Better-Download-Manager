@@ -1,0 +1,128 @@
+"""Regenerate the local benchmark comparison from five-run raw logs."""
+from pathlib import Path
+from statistics import median
+import hashlib
+import json
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[2]
+OUT = ROOT / "docs" / "optimization"
+
+
+def read_results(name, expected=9):
+    text = (OUT / name).read_text(encoding="utf-8-sig")
+    if not re.search(r"^PASS\s*$", text, re.MULTILINE):
+        raise RuntimeError(f"Benchmark did not pass: {name}")
+    results = {}
+    pattern = r"^Benchmark(?:TransferMatrix/(?P<name>\S+?)|(?P<mixed>MixedQueue))-\d+\s+\d+\s+(?P<ns>\d+) ns/op(?P<metrics>.*)$"
+    for match in re.finditer(pattern, text, re.MULTILINE):
+        key = match.group("name") or "mixed"
+        metrics = {"ns": float(match.group("ns"))}
+        for value, unit in re.findall(r"([\d.]+)\s+(MB/s|B/op|allocs/op|requests/op|peak-requests|first-byte-ms)", match.group("metrics")):
+            metrics[unit] = float(value)
+        results.setdefault(key, []).append(metrics)
+    for key, rows in results.items():
+        if len(rows) != 5:
+            raise RuntimeError(f"Expected five measurements of {key}, found {len(rows)}")
+    if len(results) != expected:
+        raise RuntimeError(f"Expected {expected} scenarios, found {len(results)}")
+    return {key: {unit: median(row[unit] for row in rows) for unit in rows[0]} for key, rows in results.items()}
+
+
+baseline = read_results("matrix-baseline.txt")
+after = read_results("matrix-after.txt")
+
+summary = {}
+table = ["| 场景 | 原版耗时 | 改造后耗时 | 耗时变化 | 内存分配变化 | 原版/改造后请求数 |", "|---|---:|---:|---:|---:|---:|"]
+for name in baseline:
+    before, current = baseline[name], after[name]
+    time_change = (current["ns"] / before["ns"] - 1) * 100
+    allocation_change = (current["B/op"] / before["B/op"] - 1) * 100
+    summary[name] = {"baseline": before, "after": current, "time_change_percent": time_change, "allocation_change_percent": allocation_change}
+    table.append(f'| {name} | {before["ns"]/1e9:.4f} s | {current["ns"]/1e9:.4f} s | {time_change:+.1f}% | {allocation_change:+.1f}% | {before["requests/op"]:.0f} / {current["requests/op"]:.0f} |')
+
+metrics_log=(OUT/"runtime-metrics.txt").read_text(encoding="utf-8-sig")
+rate_match=re.search(r"global rate=([\d.]+) KiB/s, target=(\d+) KiB/s, ratio=([\d.]+)",metrics_log)
+measured_rate=float(rate_match[1]);target_rate=int(rate_match[2]);rate_error=abs(float(rate_match[3])-1)*100
+regressions=[name for name,value in summary.items() if value["time_change_percent"]>5]
+gate_note=("所有场景的耗时变化均在 +5% 以内。" if not regressions else "以下场景的本机测量超过 +5% 目标："+"、".join(regressions)+"；保留原始数据，不将其标为全部性能准入通过。")
+executable = ROOT / "bin" / "better-download-manager.exe"
+digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+source_commit = subprocess.check_output(["git", "log", "-1", "--format=%H", "--", "internal", "frontend", "extensions", "main.go"], cwd=ROOT, text=True).strip()
+(OUT / "comparison.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+report = f"""# 下载器全链路改造与验证报告
+
+日期：2026-10-16（Asia/Shanghai）。原版基线：`4907a7a`。改造源码提交：`{source_commit}`。
+
+回退和补丁验证见 [交付验证记录](rollback.txt)。
+
+## 已完成的改造
+
+| 编号 | 问题或瓶颈 | 改造及证据 |
+|---|---|---|
+| DL-01 | 续传递归读锁、暂停恢复和旧运行收尾竞争 | 单次复制请求快照；控制状态串行转换；每次运行拥有独立完成信号；关闭等待所有 worker 和清理任务。 |
+| DL-02 | 删除与后台持久化交错导致记录复活 | 持久化和删除串行，删除失败回传；迟到进度在前端按删除终止标记丢弃；新增同步屏障回归。 |
+| DL-03 | 首条流未计入预算、热修改丢失连接计数 | 连接额度随响应体释放；共享预算原地调整；等待队列按任务轮转。 |
+| DL-04 | 未知总长 206、无 Range 重试旧长度导致截断 | 未知总长改用完整 GET；每次单流重试重建长度和校验器。原版用例分别得到 1024/8192 和 4096/8192 字节，现均完整通过。 |
+| DL-05 | 范围响应、续传偏移及磁盘文件边界校验不足 | 校验 Content-Range、Content-Length、连续覆盖、进度上界和文件 EOF；缺少匹配校验器时抽样验证；认证或临时失败保留进度。 |
+| DL-06 | checkpoint 无同步顺序、失败被忽略、sidecar 可能落后 | 捕获同一快照后同步数据、同步并替换元数据，再写数据库；递增 checkpoint 序号；恢复时优先有效的新记录；复用数据句柄并采用同步元数据写入；后台报告器在最终落盘前退出，数据库确认完成后才删除提交凭据。 |
+| DL-07 | 最终落盘覆盖目标、重命名后崩溃状态不一致 | 使用不覆盖目标的提交操作；保留冲突 `.part`；完整 sidecar 和最终文件可恢复已完成的重命名。 |
+| DL-08 | 低限速误判停滞、限速变化未唤醒等待者 | watchdog 只计网络读取；每 worker 复用且避免每次读取重排计时器；速率改变广播唤醒；未变化的设置保留令牌桶。 |
+| DL-09 | 大量重复分配、请求往返和慢尾部 | 缓冲池、网络碎片合并写入、队列游标、相邻范围合并、自适应试增；慢尾部按剩余耗时判断，取消并等待旧写入者退出后拆分；拆分块不会立即重新合并。 |
+| DL-10 | 磁盘写入失败仍进行网络重试 | 磁盘错误立即结束传输；最终 checkpoint 错误向上传递。 |
+| BR-01 | 接管先取消原下载，响应丢失后可能丢单或重复 | 先暂停，持久化接收后确认；请求 ID 去重、状态查询；扩展保存待确认条目并跨 service worker 重启查询。 |
+| BR-02 | 端口切换失败丢失旧服务、旧实例退出改写新状态 | 先绑定新监听器再退休旧服务；操作串行，并校验退出的服务实例。 |
+| UI-01 | 快速完成事件漏接、初始列表覆盖新事件 | 增加 GetTask；按稳定 ID 订阅；修订号合并；按帧批量更新。 |
+| UI-02 | 探测乱序覆盖新 URL 或用户编辑、重复点击创建多任务 | 请求序号、手工编辑保护、提交互斥；浏览器夹具确认双击仅调用 AddURL 一次，且补查得到已完成状态。 |
+| UI-03 | 历史任务全量排序和 DOM 渲染 | 按行缓存；仅排序字段变化时排序；一万条数据实际渲染 33 行，底部 27 行，行高 34 px。 |
+| UI-04 | 空文件及完成后的线程进度显示不准确 | 完成状态统一报告 100%、速度 0；线程占位也显示完成。 |
+| CFG-01 | 配置边界不一致、并发保存与共享 map | 后端验证任务 1–20、连接 1–32、非负限速和有效端口；设置串行保存并复制 map；运行时错误回传。 |
+| NET-01 | 空自定义代理悄悄直连、保存无关选项丢弃连接池 | 自定义代理显式验证，保留 SOCKS URL 凭据；按任务代理复用客户端；无关设置保留池。 |
+| WIN-01 | 文件打开经 cmd 解析、策略卸载误删其他扩展 | 使用 ShellExecute；按扩展 ID 匹配删除策略；提权脚本检查真实子进程退出码。 |
+| UPD-01 | 更新请求忽略代理、安装目录不可写、安装资产架构不匹配 | 复用代理客户端；使用用户缓存目录；选择对应架构安装包；安装前暂停并等待 checkpoint。 |
+| DEP-01 | 运行时版本漂移与三项构建依赖告警 | 固定已验证 Wails runtime；兼容更新 nanoid/postcss/source-map-js；npm audit 为 0。 |
+| MAINT-01 | 不可达旧传输路径与文档不一致 | 删除旧传输实现和无调用 helper；保留 v1/v2 元数据读取，并更新 README/CLAUDE。 |
+
+同步元数据使用 `O_SYNC`；Windows 对应 write-through，语义依据 [Microsoft CreateFileW 文档](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew#caching-behavior)和当前 Go Windows 实现。
+
+## 五轮基准比较
+
+环境：Windows amd64、Go 1.25.0、AMD Ryzen 5 5600（12 逻辑处理器）。原版与改造版使用同一份基准源文件，每个场景按原版→改造版交替串行执行五轮，取每轮耗时的中位数。tiny/small 每轮 20 次，其余场景每轮一次；测试服务器预设 Content-Type，排除 Windows MIME 注册表首次初始化对客户端测速的干扰。1 GiB 源使用重复块生成；每个输出均在计时区间外核对 SHA-256。B/op 是每次传输的分配量，不是进程峰值内存。
+
+{chr(10).join(table)}
+
+{gate_note}
+
+其中 tiny 的中位耗时增加约 {(after['tiny']['ns']-baseline['tiny']['ns'])/1e6:.2f} ms，mixed 增加约 {(after['mixed']['ns']-baseline['mixed']['ns'])/1e9:.2f} s。本轮保留了数据同步和持久化确认；混合队列回退的具体贡献尚未通过逐项隔离实验确定，不将其归因于某一单独机制。当前交付是已通过正确性验证的改造版本，整体性能准入仍未通过；后续优化须保留完整性保证，并针对这两项复测。
+
+另行剖析 mixed（不计入上述五轮）观察到 Windows 文件写入和数据同步占主要采样时间，多个写入者在文件句柄内部锁上等待。它提示后续应隔离存储与 checkpoint 的相互影响，但采样不能直接证明回退由新增同步造成。原始摘要：[CPU](mixed-cpu-profile.txt)、[阻塞](mixed-block-profile.txt)；阻塞值是各 goroutine 的累计等待时间，不是墙钟耗时。
+
+`latency` 模拟每请求 40 ms 延迟；`connection-limited` 为每连接 1 MiB/s；`bandwidth-limited` 为服务器总计 8 MiB/s；`slow-tail` 给一条范围连接施加 512 KiB/s；`mixed` 为三个并发任务槽中的大小文件混合队列。tiny/small/medium/large 分别为 64 KiB、2 MiB、64 MiB、1 GiB。所有场景使用本地服务器，不代表特定公网线路的速度承诺。
+
+原始数据：[原版](matrix-baseline.txt)、[改造版](matrix-after.txt)、[结构化比较](comparison.json)。复测：`powershell -File docs/optimization/run-benchmarks.ps1`；重新生成报告：`python docs/optimization/summarize.py`。
+
+## 功能与运行验证
+
+- `go test -race ./internal/... -count=1 -timeout=120s`：全部通过，见 [日志](tests.txt)。
+- `go vet ./internal/...`：通过，见 [日志](vet.txt)。
+- `npm test`：13 项前端状态/扩展场景通过，覆盖离线、接收拒绝、响应丢失、结果不明和迟到列表；见 [日志](frontend-tests.txt)。
+- 浏览器真实渲染夹具：一万条任务的滚动/选择/语言/清空恢复，以及探测乱序、手工字段保护、双击提交和快速完成补查均通过。夹具位于 `frontend/tests/ui`，使用模拟 API，不接触实际下载数据。
+- 两任务共享 256 KiB/s：实测 {measured_rate:.2f} KiB/s，误差约 {rate_error:.2f}%；见 [运行指标](runtime-metrics.txt)。暂停 P95 在此次系统时钟粒度下显示为 0，表示低于计时分辨率，并非宣称零延迟；全部样本低于 250 ms，另有存储被同步屏障阻塞时的暂停测试。
+- `wails3 build`：生产构建通过，见 [日志](build.txt)；[依赖审计](npm-audit.json)为 0 项。
+- Linux server 模式和非 Windows 桩代码交叉编译通过，见 [日志](cross-build.txt)。
+- 1 MiB 数据以 1 KiB 碎片读取：WriteAt 调用由逐片写入的 1024 次降至 5 次，内容和进度一致；见运行指标。
+- 原生安装、UAC 操作和浏览器商店安装未在本轮触发；相关行为以代码、纯函数测试和 HTTP/扩展夹具验证。
+
+## 程序、兼容性与回退
+
+- 程序：`D:\\APPs\\B_Download_Manager\\bin\\better-download-manager.exe`，{executable.stat().st_size:,} 字节。
+- SHA-256：`{digest}`。
+- 默认保留 5 并发任务、每任务上限 8 连接；自适应模式可在连接选项关闭。既有 SQLite 任务和 `.bdmeta` v1/v2 可读；新增 handoffs 表及可选 checkpoint 字段。
+- 浏览器扩展源码版本为 1.1.0，Chromium 源码同时嵌入程序。已安装的商店扩展不会被本地构建自动更新；新接管协议需使用本次扩展源码，可通过程序的手动安装入口提取。
+- 新增接口：GetTask、CancelHandoff；TaskInfo.revision、Settings.adaptiveConnections，以及接管 requestId/receipt。Wails 绑定由生成器更新。
+- 源码分阶段提交在 `codex/download-pipeline-optimization`。回退脚本：[PowerShell](rollback.ps1)、[sh](ROLLBACK.sh)。脚本要求干净工作区，并创建指向原版的新分支，保留优化分支和用户下载数据；重新构建后运行对应旧版程序。
+"""
+(OUT / "REPORT.md").write_text(report, encoding="utf-8")
+print(json.dumps({key: {"time_percent": round(value["time_change_percent"], 1), "allocation_percent": round(value["allocation_change_percent"], 1)} for key, value in summary.items()}, ensure_ascii=False))

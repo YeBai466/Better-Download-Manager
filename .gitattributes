@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Keep the portable rollback entry point executable in Git Bash and Unix.
+docs/optimization/ROLLBACK.sh text eol=lf
+# Preserve the literal spacing emitted by Go benchmark logs.
+docs/optimization/*.txt whitespace=-blank-at-eol

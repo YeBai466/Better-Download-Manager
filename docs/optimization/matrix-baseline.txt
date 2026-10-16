@@ -1,0 +1,316 @@
+
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/tiny-12         	      20	   7603260 ns/op	   8.62 MB/s	         1.314 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504116 B/op	     331 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.363s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/tiny-12         	      20	   8146945 ns/op	   8.04 MB/s	         1.619 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  503348 B/op	     325 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.356s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/tiny-12         	      20	   8683480 ns/op	   7.55 MB/s	         1.636 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504340 B/op	     330 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.378s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/tiny-12         	      20	   6549140 ns/op	  10.01 MB/s	         1.494 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504146 B/op	     330 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.323s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/tiny-12         	      20	   6615735 ns/op	   9.91 MB/s	         1.547 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504001 B/op	     333 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.338s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/small-12         	      20	  27739085 ns/op	  75.60 MB/s	         1.848 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504044 B/op	     329 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.815s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/small-12         	      20	  21705080 ns/op	  96.62 MB/s	         1.495 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  503501 B/op	     329 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.697s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/small-12         	      20	  10106960 ns/op	 207.50 MB/s	         1.750 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504354 B/op	     333 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.445s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/small-12         	      20	   9623540 ns/op	 217.92 MB/s	         1.482 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  503353 B/op	     326 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.431s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/small-12         	      20	  10828045 ns/op	 193.68 MB/s	         1.720 first-byte-ms	         1.000 peak-requests	         1.000 requests/op	  504119 B/op	     329 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.464s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/medium-12         	       1	 166409800 ns/op	 403.27 MB/s	         2.404 first-byte-ms	         8.000 peak-requests	        14.00 requests/op	 5258864 B/op	    3728 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.372s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/medium-12         	       1	 156620600 ns/op	 428.48 MB/s	         2.149 first-byte-ms	         8.000 peak-requests	        14.00 requests/op	 5257720 B/op	    3721 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.342s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/medium-12         	       1	 169437300 ns/op	 396.07 MB/s	         2.740 first-byte-ms	         8.000 peak-requests	        14.00 requests/op	 5253088 B/op	    3737 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.370s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/medium-12         	       1	 191587000 ns/op	 350.28 MB/s	         2.000 first-byte-ms	         8.000 peak-requests	        14.00 requests/op	 5259824 B/op	    3760 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.402s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/medium-12         	       1	 151716900 ns/op	 442.33 MB/s	         2.094 first-byte-ms	         8.000 peak-requests	        14.00 requests/op	 5257784 B/op	    3725 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.330s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/large-12         	       1	2201378500 ns/op	 487.76 MB/s	         1.525 first-byte-ms	         8.000 peak-requests	        73.00 requests/op	22377320 B/op	   11373 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	3.996s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/large-12         	       1	1923943300 ns/op	 558.09 MB/s	         3.241 first-byte-ms	         8.000 peak-requests	        73.00 requests/op	22326504 B/op	   11302 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	3.592s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/large-12         	       1	1948263200 ns/op	 551.13 MB/s	         6.919 first-byte-ms	         8.000 peak-requests	        73.00 requests/op	22321880 B/op	   11211 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	3.624s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/large-12         	       1	1982490200 ns/op	 541.61 MB/s	         2.634 first-byte-ms	         8.000 peak-requests	        73.00 requests/op	22348856 B/op	   11369 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	3.674s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/large-12         	       1	2032406100 ns/op	 528.31 MB/s	         2.006 first-byte-ms	         8.000 peak-requests	        73.00 requests/op	22334368 B/op	   11279 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	3.670s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/latency-12         	       1	1405004500 ns/op	  23.88 MB/s	        51.25 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5843096 B/op	    5072 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	1.571s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/latency-12         	       1	1408054700 ns/op	  23.83 MB/s	        51.34 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5831608 B/op	    5050 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	1.569s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/latency-12         	       1	1409973600 ns/op	  23.80 MB/s	        50.62 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5832128 B/op	    5076 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	1.568s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/latency-12         	       1	1414115900 ns/op	  23.73 MB/s	        51.63 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5831088 B/op	    5082 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	1.586s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/latency-12         	       1	1386021900 ns/op	  24.21 MB/s	        51.28 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5824200 B/op	    5004 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	1.562s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/connection-limited-12         	       1	8122978600 ns/op	   4.13 MB/s	        64.89 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5869512 B/op	    5132 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	8.290s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/connection-limited-12         	       1	8133616200 ns/op	   4.13 MB/s	        65.32 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5891400 B/op	    5239 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	8.304s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/connection-limited-12         	       1	8122530100 ns/op	   4.13 MB/s	        65.73 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5882064 B/op	    5190 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	8.283s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/connection-limited-12         	       1	8127439900 ns/op	   4.13 MB/s	        65.27 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5860992 B/op	    5130 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	8.319s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/connection-limited-12         	       1	8133681900 ns/op	   4.13 MB/s	        64.92 first-byte-ms	         4.000 peak-requests	        15.00 requests/op	 5872680 B/op	    5127 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	8.299s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/bandwidth-limited-12         	       1	2057184900 ns/op	   8.16 MB/s	        10.20 first-byte-ms	         4.000 peak-requests	         9.000 requests/op	 3596192 B/op	    3458 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.189s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/bandwidth-limited-12         	       1	2054562400 ns/op	   8.17 MB/s	        10.18 first-byte-ms	         4.000 peak-requests	         9.000 requests/op	 3567520 B/op	    3397 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.187s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/bandwidth-limited-12         	       1	2064419800 ns/op	   8.13 MB/s	        10.88 first-byte-ms	         4.000 peak-requests	         9.000 requests/op	 3578416 B/op	    3418 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.217s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/bandwidth-limited-12         	       1	2060373300 ns/op	   8.14 MB/s	        11.13 first-byte-ms	         4.000 peak-requests	         9.000 requests/op	 3584744 B/op	    3447 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.201s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/bandwidth-limited-12         	       1	2060097100 ns/op	   8.14 MB/s	        11.01 first-byte-ms	         4.000 peak-requests	         9.000 requests/op	 3597960 B/op	    3479 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.199s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/slow-tail-12         	       1	16090805100 ns/op	   4.17 MB/s	         2.105 first-byte-ms	         4.000 peak-requests	        13.00 requests/op	 4722008 B/op	    3819 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	16.308s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/slow-tail-12         	       1	16076234900 ns/op	   4.17 MB/s	         2.043 first-byte-ms	         4.000 peak-requests	        13.00 requests/op	 4701992 B/op	    3757 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	16.289s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/slow-tail-12         	       1	16072587800 ns/op	   4.18 MB/s	         2.103 first-byte-ms	         4.000 peak-requests	        13.00 requests/op	 4713432 B/op	    3786 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	16.275s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/slow-tail-12         	       1	16070842100 ns/op	   4.18 MB/s	         2.127 first-byte-ms	         4.000 peak-requests	        13.00 requests/op	 4712216 B/op	    3792 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	16.293s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkTransferMatrix/slow-tail-12         	       1	16077344600 ns/op	   4.17 MB/s	         1.913 first-byte-ms	         4.000 peak-requests	        13.00 requests/op	 4695600 B/op	    3748 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	16.295s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkMixedQueue-12    	       1	2946264700 ns/op	  25.16 MB/s	        19.00 requests/op	 8166728 B/op	    5038 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	3.292s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkMixedQueue-12    	       1	1728819100 ns/op	  42.87 MB/s	        19.00 requests/op	 8305864 B/op	    5087 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.059s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkMixedQueue-12    	       1	2127438000 ns/op	  34.84 MB/s	        19.00 requests/op	 8316120 B/op	    5137 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.433s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkMixedQueue-12    	       1	1351969300 ns/op	  54.82 MB/s	        19.00 requests/op	 8268408 B/op	    5068 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	1.698s
+goos: windows
+goarch: amd64
+pkg: github.com/yebai/better-download-manager/internal/downloader
+cpu: AMD Ryzen 5 5600 6-Core Processor              
+BenchmarkMixedQueue-12    	       1	2138132300 ns/op	  34.67 MB/s	        19.00 requests/op	 8313736 B/op	    5110 allocs/op
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	2.494s

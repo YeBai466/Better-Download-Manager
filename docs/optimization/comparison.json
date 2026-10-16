@@ -1,0 +1,196 @@
+{
+  "tiny": {
+    "baseline": {
+      "ns": 7603260.0,
+      "MB/s": 8.62,
+      "first-byte-ms": 1.547,
+      "peak-requests": 1.0,
+      "requests/op": 1.0,
+      "B/op": 504116.0,
+      "allocs/op": 330.0
+    },
+    "after": {
+      "ns": 8925245.0,
+      "MB/s": 7.34,
+      "first-byte-ms": 1.583,
+      "peak-requests": 1.0,
+      "requests/op": 1.0,
+      "B/op": 321124.0,
+      "allocs/op": 362.0
+    },
+    "time_change_percent": 17.387081330902788,
+    "allocation_change_percent": -36.2995818422744
+  },
+  "small": {
+    "baseline": {
+      "ns": 10828045.0,
+      "MB/s": 193.68,
+      "first-byte-ms": 1.72,
+      "peak-requests": 1.0,
+      "requests/op": 1.0,
+      "B/op": 504044.0,
+      "allocs/op": 329.0
+    },
+    "after": {
+      "ns": 11336245.0,
+      "MB/s": 185.0,
+      "first-byte-ms": 1.732,
+      "peak-requests": 1.0,
+      "requests/op": 1.0,
+      "B/op": 321106.0,
+      "allocs/op": 361.0
+    },
+    "time_change_percent": 4.693368008721799,
+    "allocation_change_percent": -36.29405369372515
+  },
+  "medium": {
+    "baseline": {
+      "ns": 166409800.0,
+      "MB/s": 403.27,
+      "first-byte-ms": 2.149,
+      "peak-requests": 8.0,
+      "requests/op": 14.0,
+      "B/op": 5257784.0,
+      "allocs/op": 3728.0
+    },
+    "after": {
+      "ns": 154087700.0,
+      "MB/s": 435.52,
+      "first-byte-ms": 2.089,
+      "peak-requests": 8.0,
+      "requests/op": 9.0,
+      "B/op": 3876504.0,
+      "allocs/op": 3180.0
+    },
+    "time_change_percent": -7.404672080610641,
+    "allocation_change_percent": -26.27114388875618
+  },
+  "large": {
+    "baseline": {
+      "ns": 1982490200.0,
+      "MB/s": 541.61,
+      "first-byte-ms": 2.634,
+      "peak-requests": 8.0,
+      "requests/op": 73.0,
+      "B/op": 22334368.0,
+      "allocs/op": 11302.0
+    },
+    "after": {
+      "ns": 1938348500.0,
+      "MB/s": 553.95,
+      "first-byte-ms": 2.114,
+      "peak-requests": 8.0,
+      "requests/op": 34.0,
+      "B/op": 5389168.0,
+      "allocs/op": 6773.0
+    },
+    "time_change_percent": -2.2265784718633164,
+    "allocation_change_percent": -75.87051489435474
+  },
+  "latency": {
+    "baseline": {
+      "ns": 1408054700.0,
+      "MB/s": 23.83,
+      "first-byte-ms": 51.28,
+      "peak-requests": 4.0,
+      "requests/op": 15.0,
+      "B/op": 5831608.0,
+      "allocs/op": 5072.0
+    },
+    "after": {
+      "ns": 1288584900.0,
+      "MB/s": 26.04,
+      "first-byte-ms": 51.48,
+      "peak-requests": 4.0,
+      "requests/op": 8.0,
+      "B/op": 2865400.0,
+      "allocs/op": 4223.0
+    },
+    "time_change_percent": -8.48474139534494,
+    "allocation_change_percent": -50.86432421383604
+  },
+  "connection-limited": {
+    "baseline": {
+      "ns": 8127439900.0,
+      "MB/s": 4.13,
+      "first-byte-ms": 65.27,
+      "peak-requests": 4.0,
+      "requests/op": 15.0,
+      "B/op": 5872680.0,
+      "allocs/op": 5132.0
+    },
+    "after": {
+      "ns": 8123049900.0,
+      "MB/s": 4.13,
+      "first-byte-ms": 65.6,
+      "peak-requests": 5.0,
+      "requests/op": 11.0,
+      "B/op": 3100712.0,
+      "allocs/op": 4966.0
+    },
+    "time_change_percent": -0.05401454891102997,
+    "allocation_change_percent": -47.20107344517325
+  },
+  "bandwidth-limited": {
+    "baseline": {
+      "ns": 2060097100.0,
+      "MB/s": 8.14,
+      "first-byte-ms": 10.88,
+      "peak-requests": 4.0,
+      "requests/op": 9.0,
+      "B/op": 3584744.0,
+      "allocs/op": 3447.0
+    },
+    "after": {
+      "ns": 2058633300.0,
+      "MB/s": 8.15,
+      "first-byte-ms": 10.69,
+      "peak-requests": 4.0,
+      "requests/op": 6.0,
+      "B/op": 2234240.0,
+      "allocs/op": 3131.0
+    },
+    "time_change_percent": -0.07105490318878305,
+    "allocation_change_percent": -37.67365256765894
+  },
+  "slow-tail": {
+    "baseline": {
+      "ns": 16076234900.0,
+      "MB/s": 4.17,
+      "first-byte-ms": 2.103,
+      "peak-requests": 4.0,
+      "requests/op": 13.0,
+      "B/op": 4712216.0,
+      "allocs/op": 3786.0
+    },
+    "after": {
+      "ns": 2284640000.0,
+      "MB/s": 29.37,
+      "first-byte-ms": 2.671,
+      "peak-requests": 4.0,
+      "requests/op": 9.0,
+      "B/op": 2366488.0,
+      "allocs/op": 2944.0
+    },
+    "time_change_percent": -85.788712256251,
+    "allocation_change_percent": -49.77972147286967
+  },
+  "mixed": {
+    "baseline": {
+      "ns": 2127438000.0,
+      "MB/s": 34.84,
+      "requests/op": 19.0,
+      "B/op": 8305864.0,
+      "allocs/op": 5087.0
+    },
+    "after": {
+      "ns": 2932773700.0,
+      "MB/s": 25.27,
+      "requests/op": 14.0,
+      "B/op": 5694216.0,
+      "allocs/op": 4777.0
+    },
+    "time_change_percent": 37.85472009055022,
+    "allocation_change_percent": -31.443423586035124
+  }
+}

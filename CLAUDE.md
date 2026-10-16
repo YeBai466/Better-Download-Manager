@@ -48,7 +48,7 @@ cd frontend && npm run build   # tsc + vite build（wails3 build 会自动做）
 
 严格分层 —— 下载引擎完全不知道 UI、存储和 Wails 的存在：
 
-- `internal/downloader` —— 下载引擎。纯 Go，可独立测试，只通过 `downloader.Config` 里的回调（`OnUpdate`、`OnPersist`、`OnRemoved`）和 `ClientFactory` 与外界通信。
+- `internal/downloader` —— 下载引擎。纯 Go，可独立测试，只通过 `downloader.Config` 里的回调（`OnUpdate`、可回传错误的 `Persist` / `RemoveRecord`、`OnRemoved`；兼容旧的 `OnPersist`）和 `ClientFactory` 与外界通信。
 - `internal/service` —— 唯一的 Wails 绑定服务（`DownloadService`）。持有引擎、store 和接管服务；把上述回调接到事件和 SQLite 上；负责窗口、设置、更新、扩展安装。
 - `internal/store` —— SQLite 持久化（`modernc.org/sqlite`，无 CGO），WAL 模式，`SetMaxOpenConns(1)` 串行化写入。
 - `internal/takeover` —— 仅监听回环地址的 HTTP 服务（`/ping`、`/download`），浏览器扩展往这里 POST。
@@ -63,11 +63,11 @@ cd frontend && npm run build   # tsc + vite build（wails3 build 会自动做）
 - **`Chunk`** —— 持久化的下载计划。被持久化、重试、续传的是 chunk；动态调度器从队列里把 chunk 分发给 worker。
 - **`Segment`** —— 只是 **UI 通道**（进度对话框里每条线程的进度行），不是实际的工作单位。
 
-`fastStartV2` 在流式读取第一个响应体的同时并行铺开剩余 chunk，因此下载立刻跑满速度，而不是先浪费一个往返去探测。`engine.go` 里的 `fastStartLegacy` / `transferLegacy` 是旧的单计划路径，保留但已不可达 —— `fastStart` / `transfer` 都转发到 V2 版本。
+`fastStartV2` 在流式读取第一个响应体的同时并行铺开剩余 chunk，因此下载立刻跑满速度，而不是先浪费一个往返去探测。旧的单计划路径已经移除。`scheduler.go` 统一协调连接试增、退避与慢尾块重分配；旧写入者退出后才允许拆分其剩余范围。
 
 续传状态**故意存两份**：紧挨 `.part` 文件的 `.bdmeta` JSON sidecar（数据库丢失或损坏也能恢复）+ SQLite 记录。续传时引擎会重新校验 ETag / Last-Modified / 大小 / 最终 URL，任一不匹配就从头下载。`.part` 文件**故意不预分配** —— 在 Windows 上遇到杀软和过滤驱动时，大文件 `Truncate` 慢得离谱。
 
-连接数随文件大小自适应（`internal/downloader/policy.go`）：<8 MiB 用 1 连接，随后在跨过 64 MiB、512 MiB 时依次为 2 / 4 / 用户请求的完整值（默认 8）。分块大小同样按 1 / 8 / 16 MiB 递增。
+连接数随文件大小自适应（`internal/downloader/policy.go`）：<8 MiB 用 1 连接，8–64 MiB 初始最多 4 连接，64–512 MiB 初始最多 8 连接，更大的文件使用用户请求值（默认 8）。自适应模式在此基础上按吞吐收益试增，始终受任务上限与全局预算约束。分块大小按 2 / 8 / 16 MiB 递增，相邻块可合并请求，但刚拆分的尾块保持独立。
 
 `internal/httpclient` **故意禁用 HTTP/2**（`TLSNextProto: map[...]{}`）—— 把所有 range 请求复用到一条 TCP 连接上会彻底废掉多连接模型。不要"修"这个。HTTP client 是代理感知的，并在 service 里按 `proxy.Settings` 缓存，因为代理是每任务级别的设置。
 
@@ -81,7 +81,7 @@ i18n（`frontend/src/i18n.ts`）是模块级当前语言 + 订阅 hook；在每�
 
 ### 浏览器接管
 
-程序监听 `127.0.0.1:9614`（端口和开关可配置）。扩展取消浏览器自带下载并把请求 POST 过来；程序没运行时扩展静默回退为原生下载。`TakeoverAction` 决定弹对话框还是直接开始。扩展源码在 `extensions/chromium`（MV3，同时被 `go:embed` 进 exe 供手动"加载已解压的扩展程序"）和 `extensions/firefox`。已发布的商店 ID `hgkakilajhnbpmhmpcnblioiiaomdkjp` 硬编码为 `service.StoreExtensionID`，必须与 `policy` 里的强制安装项保持一致。
+程序监听 `127.0.0.1:9614`（端口和开关可配置）。扩展先探测应用协议，再暂停浏览器下载并提交带请求 ID 的接管请求，收到持久化确认后才取消原任务；程序未运行时原下载继续。响应丢失时按请求 ID 查询，并由扩展持久化待确认条目以跨 service worker 重启恢复。`TakeoverAction` 决定弹对话框还是直接开始。扩展源码在 `extensions/chromium`（MV3，同时被 `go:embed` 进 exe 供手动"加载已解压的扩展程序"）和 `extensions/firefox`。已发布的商店 ID `hgkakilajhnbpmhmpcnblioiiaomdkjp` 硬编码为 `service.StoreExtensionID`，必须与 `policy` 里的强制安装项保持一致。
 
 ## 发版 / 版本号
 
@@ -95,7 +95,7 @@ i18n（`frontend/src/i18n.ts`）是模块级当前语言 + 订阅 hook；在每�
 
 `build/windows/nsis/project.nsi` **必须保持纯 ASCII** —— 出现非 ASCII 字节会让 `makensis` 报 "Bad text encoding" 失败。它产出的安装包文件名正是 `internal/updates` 在 GitHub Release（`YeBai466/Better-Download-Manager`）里查找的资产名，改名会直接破坏应用内更新。
 
-应用内更新会把安装包下载到 `<安装目录>/tmp` 并运行它覆盖安装；`CleanupUpdateTmp()` 在启动时清理残留。
+应用内更新会把安装包下载到用户缓存目录下的 `BetterDownloadManager/updates`，等待活动下载完成 checkpoint 后运行它覆盖安装；`CleanupUpdateTmp()` 在启动时清理残留。
 
 ## 约定
 

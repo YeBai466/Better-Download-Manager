@@ -1,0 +1,43 @@
+Independent-copy rollback verification (original workspace retained)
+COMMAND: powershell -NoProfile -File D:\APPs\B_Download_Manager\docs\optimization\rollback.ps1 -Branch codex/rollback-verification
+Switched to a new branch 'codex/rollback-verification'
+Restored source revision: 4907a7ab834aecb351a0d0eb4a7daf2d171b1723
+Optimized branch retained: codex/download-pipeline-optimization
+Download data and existing build artifacts are retained. Rebuild this revision to run the baseline executable.
+exit=0
+COMMAND: bash --noprofile --norc D:/APPs/B_Download_Manager/docs/optimization/ROLLBACK.sh codex/rollback-verification-sh
+Switched to a new branch 'codex/rollback-verification-sh'
+Restored source revision: 4907a7ab834aecb351a0d0eb4a7daf2d171b1723
+Optimized branch retained: codex/download-pipeline-optimization
+Download data and existing build artifacts are retained. Rebuild this revision to run the baseline executable.
+exit=0
+Restored HEAD matches baseline: 4907a7ab834aecb351a0d0eb4a7daf2d171b1723
+BASELINE COMMAND: go test ./internal/downloader -run TestUnknownContentRangeRequiresFullResponse|TestNonRangeRetryUsesNewLength|TestFinalizePreservesExistingDestination|TestSpeedLimitChangeWakesWaiter -count=1 -timeout=30s -v
+=== RUN   TestUnknownContentRangeRequiresFullResponse
+    reproduced_baseline_test.go:29: size mismatch: got 1024 want 8192
+--- FAIL: TestUnknownContentRangeRequiresFullResponse (0.05s)
+=== RUN   TestNonRangeRetryUsesNewLength
+    reproduced_baseline_test.go:57: size mismatch: got 4096 want 8192
+--- FAIL: TestNonRangeRetryUsesNewLength (0.27s)
+=== RUN   TestFinalizePreservesExistingDestination
+    reproduced_baseline_test.go:71: expected destination conflict
+--- FAIL: TestFinalizePreservesExistingDestination (0.01s)
+=== RUN   TestSpeedLimitChangeWakesWaiter
+    reproduced_baseline_test.go:91: rate change did not wake waiter
+--- FAIL: TestSpeedLimitChangeWakesWaiter (0.23s)
+FAIL
+FAIL	github.com/yebai/better-download-manager/internal/downloader	6.407s
+FAIL
+BASELINE exit=1 (four expected regression failures)
+MODIFIED COMMAND: go test ./internal/downloader -run TestUnknownContentRangeRequiresFullResponse|TestNonRangeRetryUsesNewLength|TestFinalizePreservesExistingDestination|TestSpeedLimitChangeWakesWaiter -count=1 -timeout=30s -v
+=== RUN   TestUnknownContentRangeRequiresFullResponse
+--- PASS: TestUnknownContentRangeRequiresFullResponse (0.06s)
+=== RUN   TestNonRangeRetryUsesNewLength
+--- PASS: TestNonRangeRetryUsesNewLength (0.29s)
+=== RUN   TestFinalizePreservesExistingDestination
+--- PASS: TestFinalizePreservesExistingDestination (0.01s)
+=== RUN   TestSpeedLimitChangeWakesWaiter
+--- PASS: TestSpeedLimitChangeWakesWaiter (0.03s)
+PASS
+ok  	github.com/yebai/better-download-manager/internal/downloader	0.526s
+MODIFIED exit=0

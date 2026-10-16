@@ -1,0 +1,25 @@
+
+> react-ts-latest@0.0.0 test
+> node --test tests/*.test.mjs
+
+✔ chromium: offline app keeps original download running (18.1298ms)
+✔ chromium: cancellation follows durable acknowledgement (8.5833ms)
+✔ chromium: lost response is reconciled without duplicate download (4.5115ms)
+✔ chromium: rejected receipt resumes the original (3.8669ms)
+✔ chromium: unknown outcome retains the paused original and receipt (3.7996ms)
+✔ firefox: offline app keeps original download running (6.5125ms)
+✔ firefox: cancellation follows durable acknowledgement (3.5174ms)
+✔ firefox: lost response is reconciled without duplicate download (3.3119ms)
+✔ firefox: rejected receipt resumes the original (5.104ms)
+✔ firefox: unknown outcome retains the paused original and receipt (7.5931ms)
+✔ late initial snapshot preserves a newer progress event (1.8672ms)
+✔ removed task stays removed after late progress and reload (0.2506ms)
+✔ ten thousand history records retain identity when an active task changes (11.526ms)
+ℹ tests 13
+ℹ suites 0
+ℹ pass 13
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 396.8138
